@@ -71,6 +71,24 @@ cmd/vrclog/main.go
 - `internal/api` depends only on interfaces, not implementations
 - `cmd/vrclog/main.go` wires concrete implementations
 
+### API Package Structure
+
+The `internal/api` package provides HTTP server with SSE support:
+- `server.go` - Server with ServerOption pattern, route registration
+- `hub.go` - SSE Hub (1 goroutine + channel management, no mutex)
+- `events.go` - GET /api/v1/events handler with cursor pagination
+- `stream.go` - GET /api/v1/stream SSE handler with Last-Event-ID replay
+- `middleware.go` - Basic Auth middleware with SHA-256 constant-time comparison
+- `json.go` - JSON response helper
+
+Key features:
+- WriteTimeout=0 for SSE long-lived connections
+- Hub uses channel pattern (register/unregister/broadcast) for thread safety
+- SSE `id` field uses cursor format (`base64(ts|id)`) for direct QueryEvents compatibility
+- Last-Event-ID replay limited to 5 pages (500 events) best-effort
+- Heartbeat every 20 seconds (`":\n\n"`) to prevent proxy timeouts
+- Hub.Stop is idempotent (uses sync.Once)
+
 ### Store Package Structure
 
 The `internal/store` package separates concerns:
@@ -157,6 +175,20 @@ Key features:
 - **Timer injection**: Use `WithAfterFunc(fakeAfterFunc)` in notify package for deterministic batch tests
 - **Mock sender**: `MockSender` in tests allows verifying Discord payloads without HTTP calls
 - **Fake timer handle**: `FakeTimerHandle` with `Fire()` method triggers batch flush synchronously
+
+## API Routes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | /api/v1/health | No | Health check |
+| GET | /api/v1/events | If LAN | Query events with cursor pagination |
+| GET | /api/v1/stream | If LAN | SSE stream with Last-Event-ID replay |
+
+Query parameters for `/api/v1/events`:
+- `since`, `until` - RFC3339 timestamps
+- `type` - `player_join`, `player_left`, `world_join`
+- `limit` - Max items per page
+- `cursor` - Pagination cursor from previous response
 
 ## PR Rules
 
