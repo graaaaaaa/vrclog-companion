@@ -51,12 +51,14 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 |---------|---------|
 | `internal/api` | HTTP API server (JSON + SSE + Auth) |
 | `internal/app` | Use case layer (business logic interfaces) |
+| `internal/appinfo` | App identity constants (name, dir, mutex, filenames) |
+| `internal/config` | Config/secrets management with atomic writes |
+| `internal/singleinstance` | Single instance control (Windows mutex, macOS no-op) |
 | `internal/version` | Build version info (ldflags injection) |
 | `internal/store` | SQLite persistence (planned) |
 | `internal/ingest` | Log monitoring via vrclog-go (planned) |
 | `internal/derive` | Current state tracker (planned) |
 | `internal/notify` | Discord Webhook (planned) |
-| `internal/config` | Config/secrets management (planned) |
 
 ### Dependency Injection Pattern
 
@@ -75,8 +77,12 @@ cmd/vrclog/main.go
 
 - **Deduplication**: `dedupe_key = SHA256(raw_line)` with UNIQUE constraint
 - **Security defaults**: Binds to `127.0.0.1` by default. LAN mode requires Basic Auth
-- **Config location**: `%LOCALAPPDATA%/vrclog/` (config.json, secrets.dat, vrclog.sqlite)
-- **Atomic writes**: Config files use tmp→rename pattern
+- **Config location**: `%LOCALAPPDATA%/vrclog/` on Windows, `~/.config/vrclog/` on other platforms
+- **Config files**: config.json (non-sensitive), secrets.json (sensitive), vrclog.sqlite (database)
+- **Atomic writes**: Config files use tmp→rename (POSIX) or MoveFileEx (Windows)
+- **Single instance**: Windows uses CreateMutex (session-scoped), macOS is no-op for development
+- **Secrets masking**: `Secret` type with `String()` returning `[REDACTED]` for log safety
+- **Config resilience**: Corrupt/missing config falls back to defaults with warning (non-fatal)
 - **Version injection**: Use `-ldflags "-X .../internal/version.Version=X.Y.Z"` at build time
 
 ## PR Rules
