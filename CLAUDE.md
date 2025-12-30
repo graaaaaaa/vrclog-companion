@@ -51,6 +51,7 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 | `internal/appinfo` | App identity constants (name, dir, mutex, filenames) |
 | `internal/config` | Config/secrets management with atomic writes |
 | `internal/event` | Shared Event model (`*string` fields, JSON-ready) |
+| `internal/ingest` | Log monitoring via vrclog-go, event ingestion to SQLite |
 | `internal/singleinstance` | Single instance control (Windows mutex, macOS no-op) |
 | `internal/store` | SQLite persistence (WAL mode, deduplication, cursor pagination) |
 | `internal/version` | Build version info (ldflags injection) |
@@ -73,10 +74,30 @@ cmd/vrclog/main.go
 The `internal/store` package separates concerns:
 - `store.go` - Open/Close, TimeFormat constant
 - `events.go` - InsertEvent, QueryEvents, GetLastEventTime, CountEvents
+- `parse_failures.go` - InsertParseFailure for logging parse errors
 - `cursor.go` - URL-safe base64 cursor encoding/decoding
 - `row.go` - DB row ↔ `event.Event` mapping, validation
 - `errors.go` - Typed errors (`ErrInvalidCursor`, `ErrInvalidEvent`)
-- `migrate.go` - Schema creation (events, ingest_cursor tables)
+- `migrate.go` - Schema creation (events, ingest_cursor, parse_failures tables)
+
+### Ingest Package Structure
+
+The `internal/ingest` package handles log monitoring:
+- `source.go` - EventSource interface for testing abstraction
+- `vrclog_source.go` - vrclog-go watcher implementation with configurable buffer sizes
+- `convert.go` - Event conversion + SHA256 dedupe key + Clock interface
+- `ingest.go` - Ingester loop coordinating source → store
+- `replay.go` - Replay time calculation helper
+
+Key features:
+- On startup, replays events from (last_event_time - 5 min) via WithReplaySinceTime
+- Requires WithIncludeRawLine(true) for SHA256 dedupe key
+- Handles ParseError by saving to parse_failures table
+- Context cancellation stops watcher cleanly (no goroutine leaks)
+- Interface abstraction allows unit testing without vrclog-go dependency
+- Clock injection for deterministic testing (avoids time.Now() in tests)
+- Nil-channel pattern for independent channel closure handling
+- Configurable buffer sizes (default: event=64, error=16) to reduce DB backpressure
 
 ### Key Design Decisions
 
@@ -90,6 +111,15 @@ The `internal/store` package separates concerns:
 - **Single instance**: Windows uses CreateMutex (session-scoped), macOS is no-op for development
 - **Secrets masking**: `Secret` type with `String()` returning `[REDACTED]` for log safety
 - **Config resilience**: Corrupt/missing config falls back to defaults with warning (non-fatal)
+- **Clock injection**: `Clock` interface in `ingest/convert.go` allows deterministic time testing
+- **Nil-channel pattern**: Both `vrclog_source.go` and `ingest.go` use nil-channel pattern to handle independent channel closures without losing events
+
+## Testing Patterns
+
+- **Interface abstraction**: `EventSource` interface allows mocking vrclog-go for unit tests
+- **Clock injection**: Use `WithClock(clock)` option to inject test clocks for deterministic timestamps
+- **Buffer configuration**: Use `WithEventBufferSize`/`WithErrorBufferSize` options to control channel throughput in tests
+- **Replay calculation**: Use `CalculateReplaySinceWithClock` for deterministic replay time tests
 
 ## PR Rules
 
