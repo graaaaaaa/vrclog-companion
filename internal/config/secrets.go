@@ -38,6 +38,7 @@ func (s Secret) IsEmpty() bool {
 type Secrets struct {
 	SchemaVersion     int    `json:"schema_version"`
 	DiscordWebhookURL Secret `json:"discord_webhook_url"`
+	BasicAuthUsername string `json:"basic_auth_username"`
 	BasicAuthPassword Secret `json:"basic_auth_password"`
 }
 
@@ -46,6 +47,7 @@ func DefaultSecrets() Secrets {
 	return Secrets{
 		SchemaVersion:     CurrentSchemaVersion,
 		DiscordWebhookURL: "",
+		BasicAuthUsername: "",
 		BasicAuthPassword: "",
 	}
 }
