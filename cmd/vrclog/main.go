@@ -74,8 +74,12 @@ func main() {
 		log.Printf("Replaying events since: %s", replaySince.Format(time.RFC3339))
 	}
 
-	// 7. Create derive state and notifier
+	// 7. Create derive state, SSE hub, and notifier
 	deriveState := derive.New()
+
+	// Create SSE hub and start its run loop
+	hub := api.NewHub()
+	go hub.Run()
 
 	var notifier *notify.Notifier
 	if !secrets.DiscordWebhookURL.IsEmpty() {
@@ -98,13 +102,15 @@ func main() {
 	}
 	source := ingest.NewVRClogSource(replaySince, sourceOpts...)
 
-	// Create ingester with OnInsert callback for derive and notify
+	// Create ingester with OnInsert callback for derive, notify, and SSE
 	ingester := ingest.New(source, db,
 		ingest.WithOnInsert(func(ctx context.Context, e *event.Event) {
 			derived := deriveState.Update(e)
 			if derived != nil && notifier != nil {
 				notifier.Enqueue(derived)
 			}
+			// Broadcast to SSE subscribers
+			hub.Publish(e)
 		}),
 	)
 
@@ -124,7 +130,23 @@ func main() {
 
 	// Build dependencies
 	health := app.HealthService{Version: version.String()}
-	server := api.NewServer(addr, health)
+	eventsService := &app.EventsService{Store: db}
+
+	// Build server options
+	serverOpts := []api.ServerOption{
+		api.WithEventsUsecase(eventsService),
+		api.WithHub(hub),
+	}
+
+	// Enable Basic Auth if LAN mode is enabled and credentials are configured
+	if cfg.LanEnabled && secrets.BasicAuthUsername != "" && !secrets.BasicAuthPassword.IsEmpty() {
+		serverOpts = append(serverOpts, api.WithBasicAuth(secrets.BasicAuthUsername, secrets.BasicAuthPassword.Value()))
+		log.Println("Basic Auth enabled for API")
+	} else if cfg.LanEnabled {
+		log.Println("WARNING: LAN mode enabled without Basic Auth; API is exposed on the local network")
+	}
+
+	server := api.NewServer(addr, health, serverOpts...)
 
 	// Graceful shutdown
 	done := make(chan os.Signal, 1)
@@ -160,6 +182,9 @@ func main() {
 		}
 		stopCancel()
 	}
+
+	// Stop SSE hub (closes all subscriber channels)
+	hub.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
