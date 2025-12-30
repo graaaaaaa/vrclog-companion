@@ -9,13 +9,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/graaaaa/vrclog-companion/internal/api"
 	"github.com/graaaaa/vrclog-companion/internal/app"
+	"github.com/graaaaa/vrclog-companion/internal/appinfo"
 	"github.com/graaaaa/vrclog-companion/internal/config"
+	"github.com/graaaaa/vrclog-companion/internal/ingest"
 	"github.com/graaaaa/vrclog-companion/internal/singleinstance"
+	"github.com/graaaaa/vrclog-companion/internal/store"
 	"github.com/graaaaa/vrclog-companion/internal/version"
 )
 
@@ -40,7 +44,50 @@ func main() {
 	port := flag.Int("port", cfg.Port, "HTTP server port")
 	flag.Parse()
 
-	// 4. Determine bind address
+	// 4. Open SQLite store
+	dataDir, err := config.EnsureDataDir()
+	if err != nil {
+		log.Fatalf("Failed to ensure data directory: %v", err)
+	}
+	dbPath := filepath.Join(dataDir, appinfo.DatabaseFileName)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// 5. Create cancellable context for ingester
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 6. Calculate replay since time (5 minutes before last event, no cap)
+	lastEventTime, err := db.GetLastEventTime(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to get last event time: %v", err)
+	}
+	replaySince := ingest.CalculateReplaySince(lastEventTime, ingest.DefaultReplayRollback)
+	if lastEventTime.IsZero() {
+		log.Printf("No previous events, starting from now")
+	} else {
+		log.Printf("Replaying events since: %s", replaySince.Format(time.RFC3339))
+	}
+
+	// 7. Create event source (use config.LogPath if set)
+	var sourceOpts []ingest.SourceOption
+	if cfg.LogPath != "" {
+		sourceOpts = append(sourceOpts, ingest.WithLogDir(cfg.LogPath))
+	}
+	source := ingest.NewVRClogSource(replaySince, sourceOpts...)
+	ingester := ingest.New(source, db)
+
+	// 8. Start ingestion in background goroutine
+	go func() {
+		if err := ingester.Run(ctx); err != nil {
+			log.Printf("Ingester error: %v", err)
+		}
+	}()
+
+	// 9. Determine bind address
 	host := "127.0.0.1"
 	if cfg.LanEnabled {
 		host = "0.0.0.0"
@@ -68,16 +115,19 @@ func main() {
 	// Wait for shutdown signal or server error
 	select {
 	case <-done:
-		log.Println("Shutting down server...")
+		log.Println("Shutting down...")
 	case err := <-errCh:
 		log.Printf("Server error: %v", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Cancel ingester context first
+	cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 	}
 
