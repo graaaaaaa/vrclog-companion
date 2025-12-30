@@ -10,7 +10,7 @@ import (
 
 // EventStore defines store operations needed by Ingester.
 type EventStore interface {
-	InsertEvent(ctx context.Context, e *event.Event) (bool, error)
+	InsertEvent(ctx context.Context, e *event.Event) (id int64, inserted bool, err error)
 	InsertParseFailure(ctx context.Context, rawLine, errorMsg string) (bool, error)
 }
 
@@ -117,7 +117,7 @@ func (i *Ingester) Run(ctx context.Context) error {
 func (i *Ingester) handleEvent(ctx context.Context, ev Event) {
 	storeEvent := ToStoreEventWithClock(ev, i.clock)
 
-	inserted, err := i.store.InsertEvent(ctx, storeEvent)
+	_, inserted, err := i.store.InsertEvent(ctx, storeEvent)
 	if err != nil {
 		i.logger.Error("failed to insert event",
 			"type", ev.Type,
@@ -130,6 +130,7 @@ func (i *Ingester) handleEvent(ctx context.Context, ev Event) {
 		i.logger.Debug("event inserted",
 			"type", ev.Type,
 			"ts", ev.Timestamp,
+			"id", storeEvent.ID,
 		)
 
 		// Call onInsert callback for side effects (e.g., notifications)

@@ -8,11 +8,16 @@ import (
 	"time"
 )
 
-// encodeCursor creates a URL-safe base64-encoded cursor from timestamp and ID.
+// EncodeCursor creates a URL-safe base64-encoded cursor from timestamp and ID.
 // Uses RawURLEncoding for safe use in HTTP query parameters.
-func encodeCursor(t time.Time, id int64) string {
+func EncodeCursor(t time.Time, id int64) string {
 	s := fmt.Sprintf("%s|%d", t.UTC().Format(TimeFormat), id)
 	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
+
+// encodeCursor is an internal alias for backward compatibility.
+func encodeCursor(t time.Time, id int64) string {
+	return EncodeCursor(t, id)
 }
 
 // decodeCursor parses a base64-encoded cursor into timestamp and ID.

@@ -87,22 +87,26 @@ type MockEventStore struct {
 	insertedErrors  []string
 	insertEventErr  error
 	insertFailErr   error
+	nextID          int64
 }
 
 func NewMockEventStore() *MockEventStore {
-	return &MockEventStore{}
+	return &MockEventStore{nextID: 1}
 }
 
-func (m *MockEventStore) InsertEvent(ctx context.Context, e *event.Event) (bool, error) {
+func (m *MockEventStore) InsertEvent(ctx context.Context, e *event.Event) (int64, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.insertEventErr != nil {
-		return false, m.insertEventErr
+		return 0, false, m.insertEventErr
 	}
 
+	id := m.nextID
+	m.nextID++
+	e.ID = id
 	m.insertedEvents = append(m.insertedEvents, e)
-	return true, nil
+	return id, true, nil
 }
 
 func (m *MockEventStore) InsertParseFailure(ctx context.Context, rawLine, errorMsg string) (bool, error) {

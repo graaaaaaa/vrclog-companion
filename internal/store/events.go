@@ -17,11 +17,12 @@ const (
 )
 
 // InsertEvent inserts an event into the database.
-// Returns true if the event was inserted, false if it was a duplicate.
+// Returns the inserted ID if successful, or 0 if the event was a duplicate.
 // Uses ON CONFLICT(dedupe_key) DO NOTHING for deduplication.
-func (s *Store) InsertEvent(ctx context.Context, e *event.Event) (inserted bool, err error) {
+// On success, sets e.ID to the inserted row's ID.
+func (s *Store) InsertEvent(ctx context.Context, e *event.Event) (id int64, inserted bool, err error) {
 	if err := validateEvent(e); err != nil {
-		return false, err
+		return 0, false, err
 	}
 
 	const query = `
@@ -46,15 +47,24 @@ func (s *Store) InsertEvent(ctx context.Context, e *event.Event) (inserted bool,
 		CurrentSchemaVersion,
 	)
 	if err != nil {
-		return false, fmt.Errorf("insert event: %w", err)
+		return 0, false, fmt.Errorf("insert event: %w", err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("rows affected: %w", err)
+		return 0, false, fmt.Errorf("rows affected: %w", err)
 	}
 
-	return rowsAffected > 0, nil
+	if rowsAffected > 0 {
+		id, err = result.LastInsertId()
+		if err != nil {
+			return 0, false, fmt.Errorf("last insert id: %w", err)
+		}
+		e.ID = id
+		return id, true, nil
+	}
+
+	return 0, false, nil
 }
 
 // QueryFilter contains filter options for querying events.

@@ -53,16 +53,19 @@ func TestInsertEvent_Dedupe(t *testing.T) {
 	}
 
 	// First insert should succeed
-	inserted, err := store.InsertEvent(ctx, evt)
+	id, inserted, err := store.InsertEvent(ctx, evt)
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
 	}
 	if !inserted {
 		t.Error("first insert should return inserted=true")
 	}
+	if id == 0 {
+		t.Error("first insert should return a non-zero id")
+	}
 
 	// Second insert with same dedupe_key should be ignored
-	inserted, err = store.InsertEvent(ctx, evt)
+	_, inserted, err = store.InsertEvent(ctx, evt)
 	if err != nil {
 		t.Fatalf("second insert: %v", err)
 	}
@@ -96,7 +99,7 @@ func TestInsertEvent_DifferentKeys(t *testing.T) {
 			DedupeKey:  "unique-key-" + string(rune('A'+i)),
 			IngestedAt: now,
 		}
-		inserted, err := store.InsertEvent(ctx, evt)
+		_, inserted, err := store.InsertEvent(ctx, evt)
 		if err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
@@ -166,7 +169,7 @@ func TestInsertEvent_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := store.InsertEvent(ctx, tt.event)
+			_, _, err := store.InsertEvent(ctx, tt.event)
 			if !errors.Is(err, ErrInvalidEvent) {
 				t.Errorf("expected ErrInvalidEvent, got %v", err)
 			}
@@ -204,7 +207,7 @@ func TestGetLastEventTime_ReturnsLatest(t *testing.T) {
 	}
 
 	for _, e := range events {
-		if _, err := store.InsertEvent(ctx, e); err != nil {
+		if _, _, err := store.InsertEvent(ctx, e); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
@@ -236,7 +239,7 @@ func TestQueryEvents_Basic(t *testing.T) {
 			DedupeKey:  "key-" + string(rune('A'+i)),
 			IngestedAt: time.Now().UTC(),
 		}
-		if _, err := store.InsertEvent(ctx, evt); err != nil {
+		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
@@ -266,7 +269,7 @@ func TestQueryEvents_WithLimit(t *testing.T) {
 			DedupeKey:  "key-" + string(rune('A'+i)),
 			IngestedAt: time.Now().UTC(),
 		}
-		if _, err := store.InsertEvent(ctx, evt); err != nil {
+		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
@@ -311,7 +314,7 @@ func TestQueryEvents_LimitClamping(t *testing.T) {
 			DedupeKey:  "key-" + string(rune('A'+i)),
 			IngestedAt: now,
 		}
-		if _, err := store.InsertEvent(ctx, evt); err != nil {
+		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
@@ -343,7 +346,7 @@ func TestQueryEvents_FilterByType(t *testing.T) {
 		{Ts: now, Type: event.TypeWorldJoin, DedupeKey: "key-4", IngestedAt: now},
 	}
 	for _, e := range events {
-		if _, err := store.InsertEvent(ctx, e); err != nil {
+		if _, _, err := store.InsertEvent(ctx, e); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 	}
