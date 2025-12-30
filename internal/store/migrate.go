@@ -20,6 +20,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 
+	// Create parse_failures table
+	if err := s.createParseFailuresTable(ctx); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -65,6 +70,26 @@ func (s *Store) createIngestCursorTable(ctx context.Context) error {
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create ingest_cursor table: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) createParseFailuresTable(ctx context.Context) error {
+	const schema = `
+	CREATE TABLE IF NOT EXISTS parse_failures (
+		id          INTEGER PRIMARY KEY,
+		ts          TEXT NOT NULL,
+		raw_line    TEXT NOT NULL,
+		error_msg   TEXT NOT NULL,
+		dedupe_key  TEXT NOT NULL,
+		UNIQUE(dedupe_key)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_parse_failures_ts ON parse_failures(ts);
+	`
+
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("create parse_failures table: %w", err)
 	}
 	return nil
 }
