@@ -17,7 +17,10 @@ import (
 	"github.com/graaaaa/vrclog-companion/internal/app"
 	"github.com/graaaaa/vrclog-companion/internal/appinfo"
 	"github.com/graaaaa/vrclog-companion/internal/config"
+	"github.com/graaaaa/vrclog-companion/internal/derive"
+	"github.com/graaaaa/vrclog-companion/internal/event"
 	"github.com/graaaaa/vrclog-companion/internal/ingest"
+	"github.com/graaaaa/vrclog-companion/internal/notify"
 	"github.com/graaaaa/vrclog-companion/internal/singleinstance"
 	"github.com/graaaaa/vrclog-companion/internal/store"
 	"github.com/graaaaa/vrclog-companion/internal/version"
@@ -37,8 +40,7 @@ func main() {
 
 	// 2. Load configuration (corrupt config falls back to defaults with warning)
 	cfg, _ := config.LoadConfig()
-	// Note: secrets loaded but not used yet (for future Discord/Auth features)
-	_, _ = config.LoadSecrets()
+	secrets, _ := config.LoadSecrets()
 
 	// 3. Parse flags (port can override config)
 	port := flag.Int("port", cfg.Port, "HTTP server port")
@@ -72,22 +74,48 @@ func main() {
 		log.Printf("Replaying events since: %s", replaySince.Format(time.RFC3339))
 	}
 
-	// 7. Create event source (use config.LogPath if set)
+	// 7. Create derive state and notifier
+	deriveState := derive.New()
+
+	var notifier *notify.Notifier
+	if !secrets.DiscordWebhookURL.IsEmpty() {
+		sender := notify.NewDiscordSender(secrets.DiscordWebhookURL)
+		notifier = notify.NewNotifier(sender, cfg.DiscordBatchSec, notify.FilterConfig{
+			NotifyOnJoin:      cfg.NotifyOnJoin,
+			NotifyOnLeave:     cfg.NotifyOnLeave,
+			NotifyOnWorldJoin: cfg.NotifyOnWorldJoin,
+		})
+		go notifier.Run(ctx)
+		log.Println("Discord notifications enabled")
+	} else {
+		log.Println("Discord webhook not configured, notifications disabled")
+	}
+
+	// 8. Create event source (use config.LogPath if set)
 	var sourceOpts []ingest.SourceOption
 	if cfg.LogPath != "" {
 		sourceOpts = append(sourceOpts, ingest.WithLogDir(cfg.LogPath))
 	}
 	source := ingest.NewVRClogSource(replaySince, sourceOpts...)
-	ingester := ingest.New(source, db)
 
-	// 8. Start ingestion in background goroutine
+	// Create ingester with OnInsert callback for derive and notify
+	ingester := ingest.New(source, db,
+		ingest.WithOnInsert(func(ctx context.Context, e *event.Event) {
+			derived := deriveState.Update(e)
+			if derived != nil && notifier != nil {
+				notifier.Enqueue(derived)
+			}
+		}),
+	)
+
+	// 9. Start ingestion in background goroutine
 	go func() {
 		if err := ingester.Run(ctx); err != nil {
 			log.Printf("Ingester error: %v", err)
 		}
 	}()
 
-	// 9. Determine bind address
+	// 10. Determine bind address
 	host := "127.0.0.1"
 	if cfg.LanEnabled {
 		host = "0.0.0.0"
@@ -121,8 +149,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Cancel ingester context first
+	// Cancel ingester context first (this also stops notifier via context)
 	cancel()
+
+	// Stop notifier gracefully (best-effort flush)
+	if notifier != nil {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := notifier.Stop(stopCtx); err != nil {
+			log.Printf("Notifier stop error: %v", err)
+		}
+		stopCancel()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
