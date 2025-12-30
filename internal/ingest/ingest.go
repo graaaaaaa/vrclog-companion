@@ -14,12 +14,17 @@ type EventStore interface {
 	InsertParseFailure(ctx context.Context, rawLine, errorMsg string) (bool, error)
 }
 
+// OnInsertFunc is called when a new event is successfully inserted.
+// It receives the event that was inserted (not a duplicate).
+type OnInsertFunc func(ctx context.Context, e *event.Event)
+
 // Ingester coordinates event ingestion from source to store.
 type Ingester struct {
-	source EventSource
-	store  EventStore
-	logger *slog.Logger
-	clock  Clock
+	source   EventSource
+	store    EventStore
+	logger   *slog.Logger
+	clock    Clock
+	onInsert OnInsertFunc
 }
 
 // Option configures an Ingester.
@@ -33,6 +38,12 @@ func WithLogger(logger *slog.Logger) Option {
 // WithClock sets the clock for the Ingester (for testing).
 func WithClock(clock Clock) Option {
 	return func(i *Ingester) { i.clock = clock }
+}
+
+// WithOnInsert sets a callback that is called when a new event is inserted.
+// This is useful for triggering side effects like notifications.
+func WithOnInsert(fn OnInsertFunc) Option {
+	return func(i *Ingester) { i.onInsert = fn }
 }
 
 // New creates a new Ingester.
@@ -120,6 +131,11 @@ func (i *Ingester) handleEvent(ctx context.Context, ev Event) {
 			"type", ev.Type,
 			"ts", ev.Timestamp,
 		)
+
+		// Call onInsert callback for side effects (e.g., notifications)
+		if i.onInsert != nil {
+			i.onInsert(ctx, storeEvent)
+		}
 	}
 }
 
