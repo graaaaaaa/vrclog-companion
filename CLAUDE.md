@@ -50,8 +50,10 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 | `internal/app` | Use case layer (business logic interfaces) |
 | `internal/appinfo` | App identity constants (name, dir, mutex, filenames) |
 | `internal/config` | Config/secrets management with atomic writes |
+| `internal/derive` | In-memory state tracking (current world, online players) |
 | `internal/event` | Shared Event model (`*string` fields, JSON-ready) |
 | `internal/ingest` | Log monitoring via vrclog-go, event ingestion to SQLite |
+| `internal/notify` | Discord Webhook notifications with batching and backoff |
 | `internal/singleinstance` | Single instance control (Windows mutex, macOS no-op) |
 | `internal/store` | SQLite persistence (WAL mode, deduplication, cursor pagination) |
 | `internal/version` | Build version info (ldflags injection) |
@@ -98,6 +100,38 @@ Key features:
 - Clock injection for deterministic testing (avoids time.Now() in tests)
 - Nil-channel pattern for independent channel closure handling
 - Configurable buffer sizes (default: event=64, error=16) to reduce DB backpressure
+- `OnInsertFunc` callback for triggering side effects (derive/notify) on new events
+
+### Derive Package Structure
+
+The `internal/derive` package manages ephemeral in-memory state:
+- `state.go` - State struct tracking current world and online players
+
+Key features:
+- Thread-safe via sync.RWMutex (API server and ingester may access concurrently)
+- Returns `DerivedEvent` indicating what changed (WorldChanged, PlayerJoined, PlayerLeft)
+- Clears player list on world change
+- Deduplicates player join events (same player joining twice returns nil)
+- Pure in-memory (no persistence, rebuilt on restart if needed)
+- PlayerID-first keying (falls back to PlayerName if ID empty) for rename tolerance
+
+### Notify Package Structure
+
+The `internal/notify` package handles Discord Webhook notifications:
+- `timer.go` - AfterFunc injection for testable batch timers
+- `backoff.go` - Exponential backoff calculation with jitter
+- `payload.go` - Discord embed payload builder
+- `sender.go` - Sender interface and DiscordSender implementation
+- `notifier.go` - Notifier with batching, filtering, and Run() loop
+
+Key features:
+- Configurable batch interval (`DiscordBatchSec`, default 3 seconds)
+- Notification filtering via `NotifyOnJoin/Leave/WorldJoin` config flags
+- Multiple events batched into single Discord request (up to 10 embeds)
+- Exponential backoff on 429/transient errors (1s initial, 5min max, 0.2 jitter)
+- Fatal stop on 401/403 (invalid webhook, stored in Status)
+- Best-effort flush on shutdown
+- AfterFunc injection for deterministic batch tests
 
 ### Key Design Decisions
 
@@ -120,6 +154,9 @@ Key features:
 - **Clock injection**: Use `WithClock(clock)` option to inject test clocks for deterministic timestamps
 - **Buffer configuration**: Use `WithEventBufferSize`/`WithErrorBufferSize` options to control channel throughput in tests
 - **Replay calculation**: Use `CalculateReplaySinceWithClock` for deterministic replay time tests
+- **Timer injection**: Use `WithAfterFunc(fakeAfterFunc)` in notify package for deterministic batch tests
+- **Mock sender**: `MockSender` in tests allows verifying Discord payloads without HTTP calls
+- **Fake timer handle**: `FakeTimerHandle` with `Fire()` method triggers batch flush synchronously
 
 ## PR Rules
 
