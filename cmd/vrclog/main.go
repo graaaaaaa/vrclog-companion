@@ -40,13 +40,49 @@ func main() {
 
 	// 2. Load configuration (corrupt config falls back to defaults with warning)
 	cfg, _ := config.LoadConfig()
-	secrets, _ := config.LoadSecrets()
+	secrets, secretsStatus, err := config.LoadSecrets()
+	if err != nil {
+		log.Printf("Warning: %v", err)
+	}
 
-	// 3. Parse flags (port can override config)
+	// 3. Ensure LAN auth credentials if LAN mode is enabled
+	updated, generatedPw, err := config.EnsureLanAuth(&secrets, cfg.LanEnabled)
+	if err != nil {
+		log.Fatalf("Failed to ensure LAN auth: %v", err)
+	}
+
+	// Only save if loaded successfully or file was missing (prevent overwrite on fallback)
+	if updated && secretsStatus != config.SecretsFallback {
+		if err := config.SaveSecrets(secrets); err != nil {
+			log.Fatalf("Failed to save secrets: %v", err)
+		}
+		if generatedPw != "" {
+			// Write password to file instead of logging
+			pwPath, err := config.WritePasswordFile(secrets.BasicAuthUsername, generatedPw)
+			if err != nil {
+				log.Printf("Warning: failed to write password file: %v", err)
+				// Fallback to log output if file write fails
+				log.Println("=== GENERATED BASIC AUTH CREDENTIALS ===")
+				log.Printf("Username: %s", secrets.BasicAuthUsername)
+				log.Printf("Password: %s", generatedPw)
+				log.Println("=========================================")
+			} else {
+				log.Println("=== BASIC AUTH CREDENTIALS GENERATED ===")
+				log.Printf("Credentials saved to: %s", pwPath)
+				log.Println("Delete this file after saving the credentials!")
+				log.Println("=========================================")
+			}
+		}
+	} else if updated && secretsStatus == config.SecretsFallback {
+		log.Println("WARNING: Secrets file has errors; new credentials not saved to avoid data loss")
+		log.Println("Please fix or delete secrets.json and restart")
+	}
+
+	// 4. Parse flags (port can override config)
 	port := flag.Int("port", cfg.Port, "HTTP server port")
 	flag.Parse()
 
-	// 4. Open SQLite store
+	// 5. Open SQLite store
 	dataDir, err := config.EnsureDataDir()
 	if err != nil {
 		log.Fatalf("Failed to ensure data directory: %v", err)
@@ -58,11 +94,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// 5. Create cancellable context for ingester
+	// 6. Create cancellable context for ingester
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 6. Calculate replay since time (5 minutes before last event, no cap)
+	// 7. Calculate replay since time (5 minutes before last event, no cap)
 	lastEventTime, err := db.GetLastEventTime(ctx)
 	if err != nil {
 		log.Printf("Warning: failed to get last event time: %v", err)
@@ -74,7 +110,7 @@ func main() {
 		log.Printf("Replaying events since: %s", replaySince.Format(time.RFC3339))
 	}
 
-	// 7. Create derive state, SSE hub, and notifier
+	// 8. Create derive state, SSE hub, and notifier
 	deriveState := derive.New()
 
 	// Create SSE hub and start its run loop
@@ -95,7 +131,7 @@ func main() {
 		log.Println("Discord webhook not configured, notifications disabled")
 	}
 
-	// 8. Create event source (use config.LogPath if set)
+	// 9. Create event source (use config.LogPath if set)
 	var sourceOpts []ingest.SourceOption
 	if cfg.LogPath != "" {
 		sourceOpts = append(sourceOpts, ingest.WithLogDir(cfg.LogPath))
@@ -114,14 +150,14 @@ func main() {
 		}),
 	)
 
-	// 9. Start ingestion in background goroutine
+	// 10. Start ingestion in background goroutine
 	go func() {
 		if err := ingester.Run(ctx); err != nil {
 			log.Printf("Ingester error: %v", err)
 		}
 	}()
 
-	// 10. Determine bind address
+	// 11. Determine bind address
 	host := "127.0.0.1"
 	if cfg.LanEnabled {
 		host = "0.0.0.0"
@@ -138,12 +174,10 @@ func main() {
 		api.WithHub(hub),
 	}
 
-	// Enable Basic Auth if LAN mode is enabled and credentials are configured
-	if cfg.LanEnabled && secrets.BasicAuthUsername != "" && !secrets.BasicAuthPassword.IsEmpty() {
+	// Enable Basic Auth for LAN mode (credentials are guaranteed by EnsureLanAuth)
+	if cfg.LanEnabled {
 		serverOpts = append(serverOpts, api.WithBasicAuth(secrets.BasicAuthUsername, secrets.BasicAuthPassword.Value()))
-		log.Println("Basic Auth enabled for API")
-	} else if cfg.LanEnabled {
-		log.Println("WARNING: LAN mode enabled without Basic Auth; API is exposed on the local network")
+		log.Println("Basic Auth enabled for LAN mode")
 	}
 
 	server := api.NewServer(addr, health, serverOpts...)
