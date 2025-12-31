@@ -4,10 +4,50 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/graaaaa/vrclog-companion/internal/api/sseauth"
 )
+
+// securityHeadersMiddleware adds security headers to all responses.
+// These headers protect against common web vulnerabilities.
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Prevent MIME type sniffing
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// Prevent clickjacking
+		w.Header().Set("X-Frame-Options", "DENY")
+
+		// Control referrer information
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+		// Content Security Policy
+		// Note: 'unsafe-inline' for style-src is needed for React inline styles
+		csp := strings.Join([]string{
+			"default-src 'self'",
+			"script-src 'self'",
+			"style-src 'self' 'unsafe-inline'",
+			"img-src 'self' data:",
+			"connect-src 'self'",
+			"font-src 'self'",
+			"base-uri 'none'",
+			"frame-ancestors 'none'",
+			"form-action 'self'",
+		}, "; ")
+		w.Header().Set("Content-Security-Policy", csp)
+
+		// Restrict browser features
+		w.Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+		// Prevent cross-origin attacks
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 // constantTimeEqualString compares two strings in constant time.
 // Uses SHA-256 hashing to ensure comparison time is independent of input lengths.

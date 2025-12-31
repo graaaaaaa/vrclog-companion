@@ -85,11 +85,12 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 	mux := http.NewServeMux()
 	s := &Server{
 		httpServer: &http.Server{
-			Addr:         addr,
-			Handler:      mux,
-			ReadTimeout:  10 * time.Second,
-			WriteTimeout: 0, // Disable for SSE (long-lived connections)
-			IdleTimeout:  60 * time.Second,
+			Addr:              addr,
+			Handler:           securityHeadersMiddleware(mux), // Apply security headers to all responses
+			ReadHeaderTimeout: 5 * time.Second,                // Slowloris protection
+			ReadTimeout:       10 * time.Second,               // Total body read timeout
+			WriteTimeout:      0,                              // Disable for SSE (long-lived connections)
+			IdleTimeout:       60 * time.Second,
 		},
 		mux:    mux,
 		health: health,
@@ -181,4 +182,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // Addr returns the server address.
 func (s *Server) Addr() string {
 	return s.httpServer.Addr
+}
+
+// Handler returns the HTTP handler for testing purposes.
+func (s *Server) Handler() http.Handler {
+	return s.httpServer.Handler
 }
