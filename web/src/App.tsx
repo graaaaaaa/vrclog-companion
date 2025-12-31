@@ -2,6 +2,7 @@ import { HashRouter, Routes, Route } from 'react-router-dom'
 import Layout from './components/Layout'
 import Now from './pages/Now'
 import History from './pages/History'
+import Stats from './pages/Stats'
 import Settings from './pages/Settings'
 
 function App() {
@@ -11,6 +12,7 @@ function App() {
         <Route path="/" element={<Layout />}>
           <Route index element={<Now />} />
           <Route path="history" element={<History />} />
+          <Route path="stats" element={<Stats />} />
           <Route path="settings" element={<Settings />} />
         </Route>
       </Routes>

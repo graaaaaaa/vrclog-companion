@@ -42,6 +42,9 @@ export interface ConfigResponse {
   notify_on_leave: boolean
   notify_on_world_join: boolean
   discord_webhook_configured: boolean
+  log_path: string
+  basic_auth_username?: string
+  basic_auth_configured: boolean
 }
 
 export interface ConfigUpdateRequest {
@@ -52,6 +55,8 @@ export interface ConfigUpdateRequest {
   notify_on_leave?: boolean
   notify_on_world_join?: boolean
   discord_webhook_url?: string
+  log_path?: string
+  basic_auth_password?: string
 }
 
 export interface ConfigUpdateResponse {
@@ -63,6 +68,14 @@ export interface ConfigUpdateResponse {
 export interface TokenResponse {
   token: string
   expires_in: number
+}
+
+export interface StatsResponse {
+  today_joins: number
+  today_leaves: number
+  today_world_changes: number
+  recent_players: string[]
+  last_event_at: string | null
 }
 
 class ApiClient {
@@ -151,6 +164,16 @@ class ApiClient {
     })
     if (!res.ok) {
       throw new Error(`Failed to fetch token: ${res.status}`)
+    }
+    return res.json()
+  }
+
+  async fetchStats(): Promise<StatsResponse> {
+    const res = await fetch('/api/v1/stats/basic', {
+      headers: this.getAuthHeader(),
+    })
+    if (!res.ok) {
+      throw new Error(`Failed to fetch stats: ${res.status}`)
     }
     return res.json()
   }

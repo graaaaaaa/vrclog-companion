@@ -32,6 +32,18 @@ function Layout() {
               History
             </NavLink>
             <NavLink
+              to="/stats"
+              className={({ isActive }) =>
+                `px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  isActive
+                    ? 'bg-blue-100 text-blue-700'
+                    : 'text-gray-600 hover:bg-gray-100'
+                }`
+              }
+            >
+              Stats
+            </NavLink>
+            <NavLink
               to="/settings"
               className={({ isActive }) =>
                 `px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
