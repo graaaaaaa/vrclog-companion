@@ -10,7 +10,7 @@ import (
 // handleGetConfig handles GET /api/v1/config requests.
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
-		http.Error(w, "config not available", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "config not available", nil)
 		return
 	}
 
@@ -21,7 +21,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 // handlePutConfig handles PUT /api/v1/config requests.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if s.cfg == nil {
-		http.Error(w, "config not available", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "config not available", nil)
 		return
 	}
 
@@ -32,13 +32,13 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields() // Strict JSON parsing
 	if err := decoder.Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
+		writeError(w, http.StatusBadRequest, "invalid request body", nil)
 		return
 	}
 
 	result, err := s.cfg.UpdateConfig(r.Context(), req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+		writeError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 

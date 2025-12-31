@@ -189,9 +189,14 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", host, *port)
 
 	// Build dependencies
-	health := app.HealthService{Version: version.String(), DB: db}
+	health := app.HealthService{
+		Version:           version.String(),
+		DB:                db,
+		DiscordConfigured: !secrets.DiscordWebhookURL.IsEmpty(),
+	}
 	eventsService := &app.EventsService{Store: db}
 	stateService := app.StateService{State: deriveState}
+	statsService := app.NewStatsService(db)
 
 	// Get config paths for ConfigService
 	configPath, _ := config.ConfigPath()
@@ -205,6 +210,7 @@ func main() {
 	serverOpts := []api.ServerOption{
 		api.WithEventsUsecase(eventsService),
 		api.WithStateUsecase(stateService),
+		api.WithStatsUsecase(statsService),
 		api.WithConfigUsecase(configService),
 		api.WithHub(hub),
 		api.WithSSESecret([]byte(secrets.SSEHMACSecret.Value())),
@@ -216,8 +222,9 @@ func main() {
 		log.Println("Web UI enabled")
 	}
 
-	// Enable Basic Auth and Rate Limiting for LAN mode
+	// Enable Basic Auth, Rate Limiting, Auth Failure Limiting, and CSRF protection for LAN mode
 	var rateLimiter *api.RateLimiter
+	var authFailureLimiter *api.AuthFailureLimiter
 	if cfg.LanEnabled {
 		serverOpts = append(serverOpts, api.WithBasicAuth(secrets.BasicAuthUsername, secrets.BasicAuthPassword.Value()))
 		log.Println("Basic Auth enabled for LAN mode")
@@ -226,6 +233,17 @@ func main() {
 		rateLimiter = api.NewRateLimiter(api.DefaultRateLimiterConfig())
 		serverOpts = append(serverOpts, api.WithRateLimiter(rateLimiter))
 		log.Println("Rate limiting enabled for LAN mode")
+
+		// Enable auth failure limiting for brute-force protection
+		authFailureLimiter = api.NewAuthFailureLimiter(api.DefaultAuthFailureLimiterConfig())
+		serverOpts = append(serverOpts, api.WithAuthFailureLimiter(authFailureLimiter))
+		log.Println("Auth failure limiting enabled for LAN mode")
+
+		// Enable CSRF protection for LAN mode
+		// Allow requests from the server's own address
+		csrfAllowedHosts := []string{addr}
+		serverOpts = append(serverOpts, api.WithCSRFAllowedHosts(csrfAllowedHosts))
+		log.Println("CSRF protection enabled for LAN mode")
 	}
 
 	server := api.NewServer(addr, health, serverOpts...)

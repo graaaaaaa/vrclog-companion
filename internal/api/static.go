@@ -38,7 +38,7 @@ func (h *spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// File not found - serve index.html for SPA routing
 	indexContent, err := fs.ReadFile(h.indexFS, "index.html")
 	if err != nil {
-		http.Error(w, "Not Found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "Not Found", nil)
 		return
 	}
 

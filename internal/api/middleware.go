@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,7 +76,7 @@ func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
 			if origin != "" {
 				originURL, err := url.Parse(origin)
 				if err != nil || !isAllowedHost(originURL.Host, allowedHosts) {
-					http.Error(w, "Forbidden: invalid origin", http.StatusForbidden)
+					writeError(w, http.StatusForbidden, "Forbidden: invalid origin", nil)
 					return
 				}
 				next.ServeHTTP(w, r)
@@ -87,7 +88,7 @@ func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
 			if referer != "" {
 				refererURL, err := url.Parse(referer)
 				if err != nil || !isAllowedHost(refererURL.Host, allowedHosts) {
-					http.Error(w, "Forbidden: invalid referer", http.StatusForbidden)
+					writeError(w, http.StatusForbidden, "Forbidden: invalid referer", nil)
 					return
 				}
 				next.ServeHTTP(w, r)
@@ -95,7 +96,7 @@ func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
 			}
 
 			// Neither Origin nor Referer present - reject for safety
-			http.Error(w, "Forbidden: missing origin/referer", http.StatusForbidden)
+			writeError(w, http.StatusForbidden, "Forbidden: missing origin/referer", nil)
 		})
 	}
 }
@@ -177,13 +178,27 @@ func constantTimeEqualString(a, b string) bool {
 
 // basicAuthMiddleware returns a middleware that checks HTTP Basic Auth credentials.
 // Uses constant-time comparison to prevent timing attacks.
-func basicAuthMiddleware(username, password string) func(http.Handler) http.Handler {
+// If afl (AuthFailureLimiter) is provided, it will track failed attempts and lock out IPs.
+func basicAuthMiddleware(username, password string, afl *AuthFailureLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := extractIP(r)
+
+			// Check if IP is locked out
+			if afl != nil && afl.IsLocked(ip) {
+				seconds := afl.LockoutSecondsRemaining(ip)
+				w.Header().Set("Retry-After", formatRetryAfter(seconds))
+				writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
+				return
+			}
+
 			u, p, ok := r.BasicAuth()
 			if !ok {
+				if afl != nil {
+					afl.RecordFailure(ip)
+				}
 				w.Header().Set("WWW-Authenticate", `Basic realm="VRClog Companion"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				writeError(w, http.StatusUnauthorized, "Unauthorized", nil)
 				return
 			}
 
@@ -192,9 +207,23 @@ func basicAuthMiddleware(username, password string) func(http.Handler) http.Hand
 			passwordMatch := constantTimeEqualString(p, password)
 
 			if !usernameMatch || !passwordMatch {
+				if afl != nil {
+					if afl.RecordFailure(ip) < 0 {
+						// IP is now locked out
+						seconds := afl.LockoutSecondsRemaining(ip)
+						w.Header().Set("Retry-After", formatRetryAfter(seconds))
+						writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
+						return
+					}
+				}
 				w.Header().Set("WWW-Authenticate", `Basic realm="VRClog Companion"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				writeError(w, http.StatusUnauthorized, "Unauthorized", nil)
 				return
+			}
+
+			// Authentication successful - clear failure counter
+			if afl != nil {
+				afl.RecordSuccess(ip)
 			}
 
 			next.ServeHTTP(w, r)
@@ -202,16 +231,38 @@ func basicAuthMiddleware(username, password string) func(http.Handler) http.Hand
 	}
 }
 
+// formatRetryAfter formats seconds as a string for the Retry-After header.
+func formatRetryAfter(seconds int) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	return strconv.Itoa(seconds)
+}
+
 // sseTokenMiddleware returns a middleware that accepts either Basic Auth or SSE token.
 // For SSE endpoints, token is passed via ?token=xxx query parameter.
-func sseTokenMiddleware(username, password string, sseSecret []byte) func(http.Handler) http.Handler {
+// If afl (AuthFailureLimiter) is provided, it will track failed attempts and lock out IPs.
+func sseTokenMiddleware(username, password string, sseSecret []byte, afl *AuthFailureLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := extractIP(r)
+
+			// Check if IP is locked out
+			if afl != nil && afl.IsLocked(ip) {
+				seconds := afl.LockoutSecondsRemaining(ip)
+				w.Header().Set("Retry-After", formatRetryAfter(seconds))
+				writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
+				return
+			}
+
 			// Try Basic Auth first
 			if u, p, ok := r.BasicAuth(); ok {
 				usernameMatch := constantTimeEqualString(u, username)
 				passwordMatch := constantTimeEqualString(p, password)
 				if usernameMatch && passwordMatch {
+					if afl != nil {
+						afl.RecordSuccess(ip)
+					}
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -222,14 +273,23 @@ func sseTokenMiddleware(username, password string, sseSecret []byte) func(http.H
 			if token != "" && len(sseSecret) > 0 {
 				_, err := sseauth.ValidateToken(token, sseSecret, sseauth.ScopeSSE, time.Now())
 				if err == nil {
+					// Token auth successful - no need to record success for token auth
 					next.ServeHTTP(w, r)
 					return
 				}
 			}
 
 			// Neither auth method succeeded
+			if afl != nil {
+				if afl.RecordFailure(ip) < 0 {
+					seconds := afl.LockoutSecondsRemaining(ip)
+					w.Header().Set("Retry-After", formatRetryAfter(seconds))
+					writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
+					return
+				}
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="VRClog Companion"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "Unauthorized", nil)
 		})
 	}
 }

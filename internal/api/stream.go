@@ -28,7 +28,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// Check for streaming support
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "streaming not supported", nil)
 		return
 	}
 
@@ -38,8 +38,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
 
-	// Parse Last-Event-ID header for reconnection support
+	// Parse Last-Event-ID header or query parameter for reconnection support
+	// Query parameter allows manual reconnection with Last-Event-ID
 	lastEventID := r.Header.Get("Last-Event-ID")
+	if lastEventID == "" {
+		lastEventID = r.URL.Query().Get("last_event_id")
+	}
 
 	// If Last-Event-ID is provided, send missed events (best-effort)
 	if lastEventID != "" {
@@ -98,6 +102,7 @@ func (s *Server) sendMissedEvents(ctx context.Context, w http.ResponseWriter, fl
 	filter := store.QueryFilter{
 		Cursor: &cursor,
 		Limit:  missedEventsPageSize,
+		Order:  store.QueryOrderAsc, // Fetch events after Last-Event-ID (forward in time)
 	}
 
 	for page := 0; page < missedEventsMaxPages; page++ {

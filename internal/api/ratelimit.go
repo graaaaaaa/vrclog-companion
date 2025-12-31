@@ -120,7 +120,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		if !rl.Allow(ip) {
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
 			return
 		}
 
@@ -267,7 +267,7 @@ func (afl *AuthFailureLimiter) Middleware(next http.Handler) http.Handler {
 		if afl.IsLocked(ip) {
 			seconds := afl.LockoutSecondsRemaining(ip)
 			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			writeError(w, http.StatusTooManyRequests, "Too Many Requests", nil)
 			return
 		}
 

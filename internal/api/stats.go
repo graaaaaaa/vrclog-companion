@@ -7,13 +7,13 @@ import (
 // handleStats handles GET /api/v1/stats/basic requests.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if s.stats == nil {
-		http.Error(w, "stats not available", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "stats not available", nil)
 		return
 	}
 
 	result, err := s.stats.GetBasicStats(r.Context())
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal error", err)
 		return
 	}
 

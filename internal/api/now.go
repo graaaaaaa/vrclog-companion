@@ -7,7 +7,7 @@ import (
 // handleNow handles GET /api/v1/now requests.
 func (s *Server) handleNow(w http.ResponseWriter, r *http.Request) {
 	if s.state == nil {
-		http.Error(w, "state not available", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "state not available", nil)
 		return
 	}
 

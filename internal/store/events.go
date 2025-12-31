@@ -67,6 +67,18 @@ func (s *Store) InsertEvent(ctx context.Context, e *event.Event) (id int64, inse
 	return 0, false, nil
 }
 
+// QueryOrder controls result ordering and cursor direction.
+type QueryOrder int
+
+const (
+	// QueryOrderDesc returns results in descending order (newest first).
+	// Cursor moves backward in time.
+	QueryOrderDesc QueryOrder = iota
+	// QueryOrderAsc returns results in ascending order (oldest first).
+	// Cursor moves forward in time. Used for SSE reconnection replay.
+	QueryOrderAsc
+)
+
 // QueryFilter contains filter options for querying events.
 type QueryFilter struct {
 	Since  *time.Time
@@ -74,6 +86,7 @@ type QueryFilter struct {
 	Type   *string
 	Limit  int
 	Cursor *string
+	Order  QueryOrder // Default: QueryOrderDesc
 }
 
 // QueryResult contains the result of a query.
@@ -116,17 +129,29 @@ WHERE 1=1
 	}
 
 	// Cursor handling (composite cursor: ts|id)
+	// Direction depends on Order: DESC moves backward, ASC moves forward.
 	if f.Cursor != nil && *f.Cursor != "" {
 		cursorTime, cursorID, err := decodeCursor(*f.Cursor)
 		if err != nil {
 			return QueryResult{}, fmt.Errorf("decode cursor: %w", err)
 		}
-		sb.WriteString(" AND (ts < ? OR (ts = ? AND id < ?))")
 		cursorTimeStr := cursorTime.UTC().Format(TimeFormat)
+		if f.Order == QueryOrderAsc {
+			// ASC: get events after cursor (newer)
+			sb.WriteString(" AND (ts > ? OR (ts = ? AND id > ?))")
+		} else {
+			// DESC: get events before cursor (older)
+			sb.WriteString(" AND (ts < ? OR (ts = ? AND id < ?))")
+		}
 		args = append(args, cursorTimeStr, cursorTimeStr, cursorID)
 	}
 
-	sb.WriteString(" ORDER BY ts DESC, id DESC")
+	// Order by timestamp and id
+	if f.Order == QueryOrderAsc {
+		sb.WriteString(" ORDER BY ts ASC, id ASC")
+	} else {
+		sb.WriteString(" ORDER BY ts DESC, id DESC")
+	}
 	sb.WriteString(" LIMIT ?")
 	args = append(args, limit+1) // fetch one extra to detect next page
 

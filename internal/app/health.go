@@ -37,8 +37,9 @@ const (
 
 // HealthService implements HealthUsecase.
 type HealthService struct {
-	Version string
-	DB      HealthChecker
+	Version           string
+	DB                HealthChecker
+	DiscordConfigured bool
 }
 
 // Handle returns the current health status.
@@ -62,6 +63,18 @@ func (s HealthService) Handle(ctx context.Context) (HealthResult, error) {
 			result.Components["database"] = ComponentHealth{
 				Status: StatusHealthy,
 			}
+		}
+	}
+
+	// Report Discord webhook configuration status
+	if s.DiscordConfigured {
+		result.Components["discord_webhook"] = ComponentHealth{
+			Status: StatusHealthy,
+		}
+	} else {
+		result.Components["discord_webhook"] = ComponentHealth{
+			Status:  "unconfigured",
+			Message: "Discord webhook not configured",
 		}
 	}
 

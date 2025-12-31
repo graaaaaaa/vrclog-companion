@@ -25,8 +25,12 @@ func Open(path string) (*Store, error) {
 	// URL-escape the path to handle special characters (?, #, spaces, etc.)
 	escapedPath := url.PathEscape(path)
 
-	// DSN with WAL mode and busy_timeout for per-connection settings
-	dsn := fmt.Sprintf("file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", escapedPath)
+	// DSN with WAL mode and recommended PRAGMAs for per-connection settings
+	// - journal_mode(WAL): Write-Ahead Logging for concurrent reads
+	// - busy_timeout(5000): Wait 5s on lock contention
+	// - synchronous(NORMAL): Safe for WAL mode, better performance than FULL
+	// - foreign_keys(ON): Enforce referential integrity
+	dsn := fmt.Sprintf("file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", escapedPath)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

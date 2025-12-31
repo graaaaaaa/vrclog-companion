@@ -21,17 +21,17 @@ type eventsResponse struct {
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	filter, err := parseEventsFilter(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 
 	result, err := s.events.Query(r.Context(), filter)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidCursor) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid cursor"})
+			writeError(w, http.StatusBadRequest, "invalid cursor", nil)
 			return
 		}
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal error", err)
 		return
 	}
 

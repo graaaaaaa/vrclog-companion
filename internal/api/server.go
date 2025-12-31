@@ -39,6 +39,9 @@ type Server struct {
 	// Rate limiter (LAN mode only)
 	rateLimiter *RateLimiter
 
+	// Auth failure limiter for brute-force protection (LAN mode only)
+	authFailureLimiter *AuthFailureLimiter
+
 	// CORS configuration
 	corsConfig *CORSConfig
 
@@ -98,6 +101,11 @@ func WithWebFS(webFS fs.FS) ServerOption {
 // WithRateLimiter enables rate limiting (recommended for LAN mode).
 func WithRateLimiter(rl *RateLimiter) ServerOption {
 	return func(s *Server) { s.rateLimiter = rl }
+}
+
+// WithAuthFailureLimiter enables brute-force protection (recommended for LAN mode).
+func WithAuthFailureLimiter(afl *AuthFailureLimiter) ServerOption {
+	return func(s *Server) { s.authFailureLimiter = afl }
 }
 
 // WithCORS enables CORS with the specified configuration.
@@ -161,7 +169,7 @@ func (s *Server) wrapAuth(h http.Handler) http.Handler {
 	if !s.authEnabled {
 		return h
 	}
-	return basicAuthMiddleware(s.authUsername, s.authPassword)(h)
+	return basicAuthMiddleware(s.authUsername, s.authPassword, s.authFailureLimiter)(h)
 }
 
 // wrapSSEAuth wraps a handler with SSE-aware auth middleware.
@@ -175,7 +183,7 @@ func (s *Server) wrapSSEAuth(h http.Handler) http.Handler {
 	if !s.authEnabled {
 		return h
 	}
-	return sseTokenMiddleware(s.authUsername, s.authPassword, s.sseSecret)(h)
+	return sseTokenMiddleware(s.authUsername, s.authPassword, s.sseSecret, s.authFailureLimiter)(h)
 }
 
 // registerRoutes sets up the API routes.
@@ -227,7 +235,7 @@ func (s *Server) registerRoutes() {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	result, err := s.health.Handle(r.Context())
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal error", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

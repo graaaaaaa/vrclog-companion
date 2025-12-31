@@ -356,6 +356,63 @@ func TestQueryEvents_DescendingOrder(t *testing.T) {
 	}
 }
 
+func TestQueryEvents_AscendingOrder(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	ctx := context.Background()
+	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Insert 4 events at increasing times.
+	for i := 0; i < 4; i++ {
+		evt := &event.Event{
+			Ts:         baseTime.Add(time.Duration(i) * time.Minute),
+			Type:       event.TypePlayerJoin,
+			DedupeKey:  "key-" + string(rune('A'+i)),
+			IngestedAt: time.Now().UTC(),
+		}
+		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Page 1 should return oldest-first.
+	result, err := store.QueryEvents(ctx, QueryFilter{Limit: 2, Order: QueryOrderAsc})
+	if err != nil {
+		t.Fatalf("QueryEvents: %v", err)
+	}
+	if len(result.Items) != 2 {
+		t.Fatalf("got %d items, want 2", len(result.Items))
+	}
+	if !result.Items[0].Ts.Equal(baseTime) {
+		t.Errorf("item[0].Ts = %v, want %v", result.Items[0].Ts, baseTime)
+	}
+	if !result.Items[1].Ts.Equal(baseTime.Add(1 * time.Minute)) {
+		t.Errorf("item[1].Ts = %v, want %v", result.Items[1].Ts, baseTime.Add(1*time.Minute))
+	}
+	if result.NextCursor == nil {
+		t.Fatal("expected NextCursor to be set")
+	}
+
+	// Page 2 should continue ascending.
+	result2, err := store.QueryEvents(ctx, QueryFilter{Limit: 2, Cursor: result.NextCursor, Order: QueryOrderAsc})
+	if err != nil {
+		t.Fatalf("QueryEvents page 2: %v", err)
+	}
+	if len(result2.Items) != 2 {
+		t.Fatalf("page 2 got %d items, want 2", len(result2.Items))
+	}
+	if !result2.Items[0].Ts.Equal(baseTime.Add(2 * time.Minute)) {
+		t.Errorf("page2 item[0].Ts = %v, want %v", result2.Items[0].Ts, baseTime.Add(2*time.Minute))
+	}
+	if !result2.Items[1].Ts.Equal(baseTime.Add(3 * time.Minute)) {
+		t.Errorf("page2 item[1].Ts = %v, want %v", result2.Items[1].Ts, baseTime.Add(3*time.Minute))
+	}
+	if result2.NextCursor != nil {
+		t.Error("expected NextCursor to be nil on last page")
+	}
+}
+
 func TestQueryEvents_LimitClamping(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
