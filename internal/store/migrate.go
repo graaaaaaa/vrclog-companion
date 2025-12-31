@@ -25,6 +25,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 
+	// Create metadata table
+	if err := s.createMetadataTable(ctx); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -90,6 +95,20 @@ func (s *Store) createParseFailuresTable(ctx context.Context) error {
 
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("create parse_failures table: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) createMetadataTable(ctx context.Context) error {
+	const schema = `
+	CREATE TABLE IF NOT EXISTS metadata (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
+	`
+
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("create metadata table: %w", err)
 	}
 	return nil
 }
