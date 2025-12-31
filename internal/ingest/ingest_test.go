@@ -10,6 +10,25 @@ import (
 	"github.com/graaaaa/vrclog-companion/internal/event"
 )
 
+// parseFailure represents an inserted parse failure for testing.
+type parseFailure struct {
+	rawLine  string
+	errorMsg string
+}
+
+// waitCh waits for a value from the channel or fails with timeout.
+func waitCh[T any](t *testing.T, ch <-chan T, name string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for %s", name)
+	}
+	var zero T
+	return zero
+}
+
 // MockEventSource implements EventSource for testing.
 type MockEventSource struct {
 	events chan Event
@@ -88,10 +107,14 @@ type MockEventStore struct {
 	insertEventErr  error
 	insertFailErr   error
 	nextID          int64
+	parseFailureCh  chan parseFailure
 }
 
 func NewMockEventStore() *MockEventStore {
-	return &MockEventStore{nextID: 1}
+	return &MockEventStore{
+		nextID:         1,
+		parseFailureCh: make(chan parseFailure, 10),
+	}
 }
 
 func (m *MockEventStore) InsertEvent(ctx context.Context, e *event.Event) (int64, bool, error) {
@@ -118,6 +141,14 @@ func (m *MockEventStore) InsertParseFailure(ctx context.Context, rawLine, errorM
 	}
 
 	m.insertedErrors = append(m.insertedErrors, rawLine)
+
+	// Notify test that parse failure was inserted
+	if m.parseFailureCh != nil {
+		select {
+		case m.parseFailureCh <- parseFailure{rawLine: rawLine, errorMsg: errorMsg}:
+		default:
+		}
+	}
 	return true, nil
 }
 
@@ -136,7 +167,15 @@ func (m *MockEventStore) GetInsertedErrors() []string {
 func TestIngester_HandleEvent(t *testing.T) {
 	source := NewMockEventSource()
 	store := NewMockEventStore()
-	ingester := New(source, store)
+
+	// Use WithOnInsert to get notified when event is inserted
+	inserted := make(chan struct{}, 1)
+	ingester := New(source, store, WithOnInsert(func(ctx context.Context, e *event.Event) {
+		select {
+		case inserted <- struct{}{}:
+		default:
+		}
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -158,8 +197,8 @@ func TestIngester_HandleEvent(t *testing.T) {
 	}
 	source.SendEvent(ev)
 
-	// Wait a bit for processing
-	time.Sleep(50 * time.Millisecond)
+	// Wait for insert notification (no more flaky time.Sleep)
+	waitCh(t, inserted, "insert")
 
 	// Check event was inserted
 	events := store.GetInsertedEvents()
@@ -208,10 +247,14 @@ func TestIngester_HandleParseError(t *testing.T) {
 	}
 	source.SendError(parseErr)
 
-	// Wait a bit for processing
-	time.Sleep(50 * time.Millisecond)
+	// Wait for parse failure notification (no more flaky time.Sleep)
+	pf := waitCh(t, store.parseFailureCh, "parse failure")
 
 	// Check error was recorded
+	if pf.rawLine != rawLine {
+		t.Errorf("expected raw line %q, got %q", rawLine, pf.rawLine)
+	}
+
 	errs := store.GetInsertedErrors()
 	if len(errs) != 1 {
 		t.Fatalf("expected 1 error, got %d", len(errs))
