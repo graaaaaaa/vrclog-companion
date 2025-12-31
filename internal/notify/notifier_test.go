@@ -77,17 +77,29 @@ type MockSender struct {
 	calls      []DiscordPayload
 	result     SendResult
 	retryAfter time.Duration
+	sendCh     chan struct{} // Notifies when Send is called
 }
 
 func NewMockSender() *MockSender {
-	return &MockSender{result: SendOK}
+	return &MockSender{
+		result: SendOK,
+		sendCh: make(chan struct{}, 10),
+	}
 }
 
 func (m *MockSender) Send(ctx context.Context, payload DiscordPayload) (SendResult, time.Duration) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.calls = append(m.calls, payload)
-	return m.result, m.retryAfter
+	result := m.result
+	retryAfter := m.retryAfter
+	m.mu.Unlock()
+
+	// Notify waiters
+	select {
+	case m.sendCh <- struct{}{}:
+	default:
+	}
+	return result, retryAfter
 }
 
 func (m *MockSender) SetResult(r SendResult, retryAfter time.Duration) {
@@ -107,6 +119,16 @@ func (m *MockSender) CallCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.calls)
+}
+
+// waitSend waits for a send notification with timeout.
+func waitSend(t *testing.T, m *MockSender) {
+	t.Helper()
+	select {
+	case <-m.sendCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for send")
+	}
 }
 
 func ptr(s string) *string { return &s }
@@ -181,16 +203,19 @@ func TestNotifier_BatchesEvents(t *testing.T) {
 	// Fire the timer
 	timerFactory.FireAll()
 
-	// Wait for flush
-	time.Sleep(50 * time.Millisecond)
+	// Wait for send (no more flaky time.Sleep)
+	waitSend(t, sender)
 
 	// Should have one batched send
 	if sender.CallCount() != 1 {
-		t.Errorf("expected 1 batched call, got %d", sender.CallCount())
+		t.Fatalf("expected 1 batched call, got %d", sender.CallCount())
 	}
 
 	// Verify batch contains all events (2 embeds: joins + leaves)
 	calls := sender.Calls()
+	if len(calls) == 0 {
+		t.Fatal("expected at least 1 call")
+	}
 	if len(calls[0].Embeds) != 2 {
 		t.Errorf("expected 2 embeds (joins + leaves), got %d", len(calls[0].Embeds))
 	}
@@ -226,15 +251,18 @@ func TestNotifier_FilterConfig(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 	timerFactory.FireAll()
-	time.Sleep(50 * time.Millisecond)
+	waitSend(t, sender)
 
 	// Should have one call
 	if sender.CallCount() != 1 {
-		t.Errorf("expected 1 call, got %d", sender.CallCount())
+		t.Fatalf("expected 1 call, got %d", sender.CallCount())
 	}
 
 	// Should only have join embed
 	calls := sender.Calls()
+	if len(calls) == 0 {
+		t.Fatal("expected at least 1 call")
+	}
 	if len(calls[0].Embeds) != 1 {
 		t.Errorf("expected 1 embed (join only), got %d", len(calls[0].Embeds))
 	}
@@ -268,7 +296,7 @@ func TestNotifier_BackoffOn429(t *testing.T) {
 	n.Enqueue(makeJoinEvent("Alice"))
 	time.Sleep(50 * time.Millisecond)
 	timerFactory.FireAll()
-	time.Sleep(50 * time.Millisecond)
+	waitSend(t, sender)
 
 	// Should have attempted to send
 	if sender.CallCount() != 1 {
@@ -279,7 +307,8 @@ func TestNotifier_BackoffOn429(t *testing.T) {
 	n.Enqueue(makeJoinEvent("Bob"))
 	time.Sleep(50 * time.Millisecond)
 	timerFactory.FireAll()
-	time.Sleep(50 * time.Millisecond)
+	// Short sleep - we expect NO send during backoff, can't wait on channel
+	time.Sleep(100 * time.Millisecond)
 
 	// Should not have sent (still in backoff)
 	if sender.CallCount() != 1 {
@@ -312,7 +341,7 @@ func TestNotifier_StopsOnFatal(t *testing.T) {
 	n.Enqueue(makeJoinEvent("Alice"))
 	time.Sleep(50 * time.Millisecond)
 	timerFactory.FireAll()
-	time.Sleep(50 * time.Millisecond)
+	waitSend(t, sender)
 
 	// Check status
 	status := n.Status()
@@ -327,7 +356,8 @@ func TestNotifier_StopsOnFatal(t *testing.T) {
 	n.Enqueue(makeJoinEvent("Bob"))
 	time.Sleep(50 * time.Millisecond)
 	timerFactory.FireAll()
-	time.Sleep(50 * time.Millisecond)
+	// Short sleep - we expect NO send (notifier disabled), can't wait on channel
+	time.Sleep(100 * time.Millisecond)
 
 	// Should only have the first call
 	if sender.CallCount() != 1 {
