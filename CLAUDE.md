@@ -21,6 +21,7 @@ go test ./...                                    # Run all tests
 go test -run TestName ./internal/store           # Run single test
 go test -tags=integration ./test/integration/... # Integration tests
 GOOS=windows GOARCH=amd64 go build -o vrclog.exe ./cmd/vrclog  # Windows build
+go build ./...                                   # Quick build check (cross-platform)
 cd web && npm run build && cd .. && cp -r web/dist/* webembed/  # Build Web UI
 cd web && npm run dev                            # Frontend dev server (proxy to :8080)
 ```
@@ -79,6 +80,8 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 - **Config resilience**: Corrupt/missing config falls back to defaults (non-fatal)
 - **Cursor pagination**: URL-safe base64 with backward compatibility
 - **Timestamps**: Fixed-width RFC3339 (`2006-01-02T15:04:05.000000000Z`) for lexicographic ordering
+- **Error responses**: Use `writeError(w, status, public, err)` for consistent JSON errors; 5xx logs internally
+- **SSE reconnection**: Supports `Last-Event-ID` header and `last_event_id` query parameter
 
 ## Testing Patterns
 
