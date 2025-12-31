@@ -34,6 +34,9 @@ type Server struct {
 
 	// Web UI filesystem
 	webFS fs.FS
+
+	// Rate limiter (LAN mode only)
+	rateLimiter *RateLimiter
 }
 
 // ServerOption configures a Server.
@@ -80,6 +83,11 @@ func WithWebFS(webFS fs.FS) ServerOption {
 	return func(s *Server) { s.webFS = webFS }
 }
 
+// WithRateLimiter enables rate limiting (recommended for LAN mode).
+func WithRateLimiter(rl *RateLimiter) ServerOption {
+	return func(s *Server) { s.rateLimiter = rl }
+}
+
 // NewServer creates a new API server with the given dependencies.
 func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Server {
 	mux := http.NewServeMux()
@@ -103,7 +111,12 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 }
 
 // wrapAuth wraps a handler with auth middleware if auth is enabled.
+// Also applies rate limiting if configured.
 func (s *Server) wrapAuth(h http.Handler) http.Handler {
+	// Apply rate limiting first (if configured)
+	if s.rateLimiter != nil {
+		h = s.rateLimiter.Middleware(h)
+	}
 	if !s.authEnabled {
 		return h
 	}
@@ -112,7 +125,12 @@ func (s *Server) wrapAuth(h http.Handler) http.Handler {
 
 // wrapSSEAuth wraps a handler with SSE-aware auth middleware.
 // Accepts both Basic Auth and SSE tokens via query parameter.
+// Also applies rate limiting if configured.
 func (s *Server) wrapSSEAuth(h http.Handler) http.Handler {
+	// Apply rate limiting first (if configured)
+	if s.rateLimiter != nil {
+		h = s.rateLimiter.Middleware(h)
+	}
 	if !s.authEnabled {
 		return h
 	}
