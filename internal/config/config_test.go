@@ -193,9 +193,12 @@ func TestSaveLoadSecrets_RoundTrip(t *testing.T) {
 	}
 
 	// Load
-	loaded, err := LoadSecretsFrom(path)
+	loaded, status, err := LoadSecretsFrom(path)
 	if err != nil {
 		t.Fatalf("failed to load secrets: %v", err)
+	}
+	if status != SecretsLoaded {
+		t.Errorf("expected status SecretsLoaded, got %v", status)
 	}
 
 	// Compare (using Value() to get actual values)
