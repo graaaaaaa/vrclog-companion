@@ -21,7 +21,7 @@ go test ./...                                    # Run all tests
 go test -run TestName ./internal/store           # Run single test
 go test -tags=integration ./test/integration/... # Integration tests
 GOOS=windows GOARCH=amd64 go build -o vrclog.exe ./cmd/vrclog  # Windows build
-cd web && npm run build && cd .. && cp -r web/dist webembed/   # Build Web UI
+cd web && npm run build && cd .. && cp -r web/dist/* webembed/  # Build Web UI
 cd web && npm run dev                            # Frontend dev server (proxy to :8080)
 ```
 
@@ -95,6 +95,7 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 | GET | /api/v1/events | If LAN | Query events with cursor pagination |
 | GET | /api/v1/stream | If LAN | SSE stream (accepts Basic Auth or token) |
 | GET | /api/v1/now | If LAN | Current world and players |
+| GET | /api/v1/stats/basic | If LAN | Today's statistics |
 | POST | /api/v1/auth/token | If LAN | Issue SSE token (5min TTL) |
 | GET | /api/v1/config | If LAN | Get config (secrets excluded) |
 | PUT | /api/v1/config | If LAN | Update config |
@@ -108,5 +109,4 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 
 ## References
 
-- `SPEC.md` - Full specification
-- `docs/IMPLEMENTATION_PLAN.md` - Milestone breakdown
+- `SPEC.md` - Full specification (Japanese)
