@@ -10,7 +10,7 @@ VRClog Companion is a Windows local resident app that monitors VRChat logs, extr
 
 ## Tech Stack
 
-- Go 1.22+, SQLite (WAL mode), React + Vite (embedded via go:embed)
+- Go 1.25+, SQLite (WAL mode), React + Vite (embedded via go:embed)
 - Target: Windows 11 (macOS supported for development)
 - Pure Go SQLite (modernc.org/sqlite, no CGO)
 

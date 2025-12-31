@@ -14,7 +14,7 @@ VRChat のローカルログを監視し、Join/Leave/World 移動イベント�
 
 ## 開発環境
 
-- Go 1.22+
+- Go 1.25+
 - Node.js 18+ (Web UI ビルド用)
 - Windows 11（ターゲット OS）
 

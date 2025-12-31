@@ -16,7 +16,7 @@ See [SPEC.md](./SPEC.md) for detailed specifications.
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.25+
 - Node.js 18+ (for Web UI build)
 - Windows 11 (target OS)
 
