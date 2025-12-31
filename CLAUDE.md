@@ -17,6 +17,11 @@ go build -o vrclog ./cmd/vrclog
 # Build for Windows (cross-compile) with version
 GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/graaaaa/vrclog-companion/internal/version.Version=0.1.0" -o vrclog.exe ./cmd/vrclog
 
+# Build with Web UI (production)
+cd web && npm install && npm run build && cd ..
+cp -r web/dist webembed/
+go build -o vrclog ./cmd/vrclog
+
 # Run tests
 go test ./...
 
@@ -28,6 +33,9 @@ go test -run TestInsertEvent_Dedupe ./internal/store
 
 # Run server with custom port
 ./vrclog -port 9000
+
+# Frontend dev server (with API proxy to :8080)
+cd web && npm run dev
 ```
 
 ## Architecture
@@ -40,6 +48,8 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
                               ├── Derive update (in-memory state)
                               ├── Discord notification
                               └── SSE broadcast
+                                           ↓
+                              Web UI (React + Vite, embedded via go:embed)
 ```
 
 ### Internal Packages
@@ -57,6 +67,8 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
 | `internal/singleinstance` | Single instance control (Windows mutex, macOS no-op) |
 | `internal/store` | SQLite persistence (WAL mode, deduplication, cursor pagination) |
 | `internal/version` | Build version info (ldflags injection) |
+| `internal/api/sseauth` | SSE token generation/validation (HMAC-SHA256) |
+| `webembed` | Embedded web UI filesystem (go:embed) |
 
 ### Dependency Injection Pattern
 
@@ -78,8 +90,13 @@ The `internal/api` package provides HTTP server with SSE support:
 - `hub.go` - SSE Hub (1 goroutine + channel management, no mutex)
 - `events.go` - GET /api/v1/events handler with cursor pagination
 - `stream.go` - GET /api/v1/stream SSE handler with Last-Event-ID replay
-- `middleware.go` - Basic Auth middleware with SHA-256 constant-time comparison
-- `json.go` - JSON response helper
+- `middleware.go` - Basic Auth + SSE token middleware with SHA-256 constant-time comparison
+- `response.go` - JSON response helper
+- `now.go` - GET /api/v1/now handler
+- `auth.go` - POST /api/v1/auth/token handler
+- `config.go` - GET/PUT /api/v1/config handlers
+- `static.go` - SPA handler with index.html fallback
+- `sseauth/token.go` - HMAC-SHA256 token generation/validation
 
 Key features:
 - WriteTimeout=0 for SSE long-lived connections
@@ -88,7 +105,16 @@ Key features:
 - Last-Event-ID replay limited to 5 pages (500 events) best-effort
 - Heartbeat every 20 seconds (`":\n\n"`) to prevent proxy timeouts
 - Hub.Stop is idempotent (uses sync.Once)
-- `wrapAuth()` centralizes auth middleware wrapping for protected routes
+- `wrapAuth()` centralizes Basic Auth middleware, `wrapSSEAuth()` accepts token OR Basic Auth
+- SSE token: `sse1.<payload_b64>.<sig_b64>` format, 5min TTL, via `?token=xxx` query param
+
+### App Package Structure
+
+The `internal/app` package defines use case interfaces:
+- `health.go` - HealthUsecase interface and HealthService
+- `events.go` - EventsUsecase interface (wraps store.Store)
+- `state.go` - StateUsecase interface (wraps derive.State for current world/players)
+- `config.go` - ConfigUsecase interface (config get/update with validation)
 
 ### Store Package Structure
 
@@ -165,6 +191,7 @@ Key features:
 - `Secret` type with `String()` returning `[REDACTED]` for log safety
 - `WritePasswordFile()` saves generated credentials to file (not logged to stdout)
 - `EnsureLanAuth()` auto-generates strong password when LAN mode enabled
+- `EnsureSSESecret()` auto-generates 32-byte HMAC secret for SSE tokens
 - Schema versioning with forward-compatible defaults
 
 ### Key Design Decisions
@@ -181,6 +208,7 @@ Key features:
 - **Config resilience**: Corrupt/missing config falls back to defaults with warning (non-fatal)
 - **Clock injection**: `Clock` interface in `ingest/convert.go` allows deterministic time testing
 - **Nil-channel pattern**: Both `vrclog_source.go` and `ingest.go` use nil-channel pattern to handle independent channel closures without losing events
+- **SSE Token Auth**: Browser EventSource can't send headers, so `/api/v1/stream` accepts `?token=xxx` with HMAC-SHA256 signed tokens (separate `SSEHMACSecret` from BasicAuthPassword)
 
 ## Testing Patterns
 
@@ -198,7 +226,11 @@ Key features:
 |--------|------|------|-------------|
 | GET | /api/v1/health | No | Health check |
 | GET | /api/v1/events | If LAN | Query events with cursor pagination |
-| GET | /api/v1/stream | If LAN | SSE stream with Last-Event-ID replay |
+| GET | /api/v1/stream | If LAN | SSE stream (accepts Basic Auth or token) |
+| GET | /api/v1/now | If LAN | Current world and players |
+| POST | /api/v1/auth/token | If LAN | Issue SSE token (5min TTL) |
+| GET | /api/v1/config | If LAN | Get config (secrets excluded) |
+| PUT | /api/v1/config | If LAN | Update config |
 
 Query parameters for `/api/v1/events`:
 - `since`, `until` - RFC3339 timestamps
