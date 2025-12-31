@@ -72,6 +72,14 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 	return s
 }
 
+// wrapAuth wraps a handler with auth middleware if auth is enabled.
+func (s *Server) wrapAuth(h http.Handler) http.Handler {
+	if !s.authEnabled {
+		return h
+	}
+	return basicAuthMiddleware(s.authUsername, s.authPassword)(h)
+}
+
 // registerRoutes sets up the API routes.
 func (s *Server) registerRoutes() {
 	// Health endpoint (no auth required)
@@ -79,22 +87,12 @@ func (s *Server) registerRoutes() {
 
 	// Events endpoint (auth required if configured)
 	if s.events != nil {
-		eventsHandler := http.HandlerFunc(s.handleEvents)
-		if s.authEnabled {
-			s.mux.Handle("GET /api/v1/events", basicAuthMiddleware(s.authUsername, s.authPassword)(eventsHandler))
-		} else {
-			s.mux.Handle("GET /api/v1/events", eventsHandler)
-		}
+		s.mux.Handle("GET /api/v1/events", s.wrapAuth(http.HandlerFunc(s.handleEvents)))
 	}
 
 	// SSE stream endpoint (auth required if configured)
 	if s.hub != nil && s.events != nil {
-		streamHandler := http.HandlerFunc(s.handleStream)
-		if s.authEnabled {
-			s.mux.Handle("GET /api/v1/stream", basicAuthMiddleware(s.authUsername, s.authPassword)(streamHandler))
-		} else {
-			s.mux.Handle("GET /api/v1/stream", streamHandler)
-		}
+		s.mux.Handle("GET /api/v1/stream", s.wrapAuth(http.HandlerFunc(s.handleStream)))
 	}
 }
 
