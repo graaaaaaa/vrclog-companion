@@ -328,15 +328,30 @@ VRChat のローカルログを監視し、Join/Leave/World移動等のイベン
 { "status": "ok", "version": "0.1.0" }
 ```
 
-### 12.2 `GET /api/v1/state`
+### 12.2 `GET /api/v1/now`
+
+現在のワールドとオンラインプレイヤーを返す。
 
 ```json
 {
-  "current_world": { "world_id": "...", "world_name": "...", "instance_id": "..." },
-  "current_players": [{ "player_name": "Alice", "last_seen": "..." }],
-  "last_event_id": 12345
+  "world": {
+    "world_id": "wrld_...",
+    "world_name": "Example World",
+    "instance_id": "12345~private(usr_...)~region(jp)",
+    "joined_at": "2025-01-01T12:00:00.000000000Z"
+  },
+  "players": [
+    {
+      "player_name": "Alice",
+      "player_id": "usr_...",
+      "joined_at": "2025-01-01T12:05:00.000000000Z"
+    }
+  ]
 }
 ```
+
+* `world` はワールド未参加時は `null`
+* `players` はワールド未参加時は空配列
 
 ### 12.3 `GET /api/v1/events`
 
@@ -353,9 +368,51 @@ VRChat のローカルログを監視し、Join/Leave/World移動等のイベン
 
 ### 12.5 `GET /api/v1/stream`（SSE）
 
-* `id:` は `events.id`
+* `id:` はカーソル形式（base64エンコード、`ts|id`）
+* `event:` はイベント種別（`player_join`, `player_left`, `world_join`）
 * `data:` はイベントJSON
 * 切断時に購読解除
+* `Last-Event-ID` ヘッダでの再接続リプレイ対応
+* ハートビート: 20秒間隔でコメント送信
+
+### 12.6 `POST /api/v1/auth/token`
+
+SSE接続用の一時トークンを発行する（LAN公開時のみ）。
+
+```json
+{
+  "token": "base64_encoded_token",
+  "expires_in": 300
+}
+```
+
+* Basic認証が必要
+* トークンはSSE接続時のクエリパラメータ `?token=...` で使用
+* 有効期限: 5分
+
+### 12.7 `GET /api/v1/config`
+
+設定情報を取得する（シークレットは除外）。
+
+```json
+{
+  "port": 8080,
+  "lan_enabled": false,
+  "log_path": "",
+  "discord_batch_sec": 3,
+  "notify_on_join": true,
+  "notify_on_leave": true,
+  "notify_on_world_join": true
+}
+```
+
+### 12.8 `PUT /api/v1/config`
+
+設定を更新する。
+
+* リクエストボディ: 更新する設定項目のJSON
+* レスポンス: `{ "success": true, "restart_required": false }`
+* `restart_required: true` の場合、ポート変更等で再起動が必要
 
 ---
 
