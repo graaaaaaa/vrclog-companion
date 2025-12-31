@@ -6,15 +6,16 @@ import (
 )
 
 func TestCalculateReplaySince_ZeroTime(t *testing.T) {
-	// When lastEventTime is zero, should return current time.
+	// When lastEventTime is zero, should return now - rollback.
 	// Use the clock-based version for deterministic testing.
 	fixedTime := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
 	clock := &testClock{t: fixedTime}
 
 	result := CalculateReplaySinceWithClock(time.Time{}, DefaultReplayRollback, clock)
 
-	if !result.Equal(fixedTime) {
-		t.Errorf("expected %v, got %v", fixedTime, result)
+	expected := fixedTime.Add(-DefaultReplayRollback)
+	if !result.Equal(expected) {
+		t.Errorf("expected %v, got %v", expected, result)
 	}
 }
 
@@ -36,8 +37,22 @@ func TestCalculateReplaySinceWithClock_ZeroTime(t *testing.T) {
 
 	result := CalculateReplaySinceWithClock(time.Time{}, DefaultReplayRollback, clock)
 
-	if !result.Equal(fixedTime) {
-		t.Errorf("expected %v, got %v", fixedTime, result)
+	expected := fixedTime.Add(-DefaultReplayRollback)
+	if !result.Equal(expected) {
+		t.Errorf("expected %v, got %v", expected, result)
+	}
+}
+
+func TestCalculateReplaySince_FirstRunRollback(t *testing.T) {
+	// First run should use 24h rollback to capture past events.
+	fixedTime := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
+	clock := &testClock{t: fixedTime}
+
+	result := CalculateReplaySinceWithClock(time.Time{}, DefaultFirstRunRollback, clock)
+
+	expected := fixedTime.Add(-DefaultFirstRunRollback)
+	if !result.Equal(expected) {
+		t.Errorf("expected %v, got %v", expected, result)
 	}
 }
 

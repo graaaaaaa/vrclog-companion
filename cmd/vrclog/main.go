@@ -115,14 +115,21 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 7. Calculate replay since time (5 minutes before last event, no cap)
+	// 7. Calculate replay since time
 	lastEventTime, err := db.GetLastEventTime(ctx)
 	if err != nil {
 		log.Printf("Warning: failed to get last event time: %v", err)
 	}
-	replaySince := ingest.CalculateReplaySince(lastEventTime, ingest.DefaultReplayRollback)
+
+	// Choose rollback based on whether we have previous events
+	rollback := ingest.DefaultReplayRollback
 	if lastEventTime.IsZero() {
-		log.Printf("No previous events, starting from now")
+		rollback = ingest.DefaultFirstRunRollback
+	}
+	replaySince := ingest.CalculateReplaySince(lastEventTime, rollback)
+
+	if lastEventTime.IsZero() {
+		log.Printf("No previous events, replaying last %v", rollback)
 	} else {
 		log.Printf("Replaying events since: %s", replaySince.Format(time.RFC3339))
 	}
