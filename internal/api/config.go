@@ -25,8 +25,13 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit request body size to 1MB to prevent DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+
 	var req app.ConfigUpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields() // Strict JSON parsing
+	if err := decoder.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
 		return
 	}

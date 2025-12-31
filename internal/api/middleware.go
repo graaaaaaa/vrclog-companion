@@ -4,11 +4,129 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/graaaaa/vrclog-companion/internal/api/sseauth"
 )
+
+// CORSConfig holds CORS middleware configuration.
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowCredentials bool
+}
+
+// corsMiddleware returns a middleware that handles CORS headers.
+// Only origins in the allowlist are permitted.
+func corsMiddleware(cfg CORSConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// Check if origin is in allowlist
+			allowed := false
+			for _, o := range cfg.AllowedOrigins {
+				if o == origin {
+					allowed = true
+					break
+				}
+			}
+
+			if allowed {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				if cfg.AllowCredentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
+			}
+
+			// Handle preflight requests
+			if r.Method == http.MethodOptions {
+				if allowed {
+					w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
+					w.WriteHeader(http.StatusNoContent)
+				} else {
+					w.WriteHeader(http.StatusForbidden)
+				}
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// csrfMiddleware returns a middleware that validates Origin/Referer headers
+// for state-changing requests (POST, PUT, DELETE) to prevent CSRF attacks.
+func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Only check state-changing methods
+			if r.Method != http.MethodPost && r.Method != http.MethodPut && r.Method != http.MethodDelete {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Check Origin header first
+			origin := r.Header.Get("Origin")
+			if origin != "" {
+				originURL, err := url.Parse(origin)
+				if err != nil || !isAllowedHost(originURL.Host, allowedHosts) {
+					http.Error(w, "Forbidden: invalid origin", http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Fall back to Referer header
+			referer := r.Header.Get("Referer")
+			if referer != "" {
+				refererURL, err := url.Parse(referer)
+				if err != nil || !isAllowedHost(refererURL.Host, allowedHosts) {
+					http.Error(w, "Forbidden: invalid referer", http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Neither Origin nor Referer present - reject for safety
+			http.Error(w, "Forbidden: missing origin/referer", http.StatusForbidden)
+		})
+	}
+}
+
+// isAllowedHost checks if the host is in the allowed list.
+// Allows localhost variants by default.
+func isAllowedHost(host string, allowedHosts []string) bool {
+	// Strip port from host
+	hostWithoutPort := host
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		hostWithoutPort = host[:idx]
+	}
+
+	// Always allow localhost variants
+	if hostWithoutPort == "localhost" || hostWithoutPort == "127.0.0.1" || hostWithoutPort == "::1" {
+		return true
+	}
+
+	// Check against allowlist
+	for _, allowed := range allowedHosts {
+		allowedWithoutPort := allowed
+		if idx := strings.LastIndex(allowed, ":"); idx != -1 {
+			allowedWithoutPort = allowed[:idx]
+		}
+		if hostWithoutPort == allowedWithoutPort {
+			return true
+		}
+	}
+
+	return false
+}
 
 // securityHeadersMiddleware adds security headers to all responses.
 // These headers protect against common web vulnerabilities.

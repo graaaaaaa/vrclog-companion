@@ -28,15 +28,16 @@ const (
 
 // Config holds non-sensitive application configuration.
 type Config struct {
-	SchemaVersion      int    `json:"schema_version"`
-	Port               int    `json:"port"`
-	LanEnabled         bool   `json:"lan_enabled"`
-	LogPath            string `json:"log_path"`
-	DiscordBatchSec    int    `json:"discord_batch_sec"`
-	AutoStartEnabled   bool   `json:"auto_start_enabled"`
-	NotifyOnJoin       bool   `json:"notify_on_join"`
-	NotifyOnLeave      bool   `json:"notify_on_leave"`
-	NotifyOnWorldJoin  bool   `json:"notify_on_world_join"`
+	SchemaVersion      int      `json:"schema_version"`
+	Port               int      `json:"port"`
+	LanEnabled         bool     `json:"lan_enabled"`
+	LogPath            string   `json:"log_path"`
+	DiscordBatchSec    int      `json:"discord_batch_sec"`
+	AutoStartEnabled   bool     `json:"auto_start_enabled"`
+	NotifyOnJoin       bool     `json:"notify_on_join"`
+	NotifyOnLeave      bool     `json:"notify_on_leave"`
+	NotifyOnWorldJoin  bool     `json:"notify_on_world_join"`
+	CORSAllowedOrigins []string `json:"cors_allowed_origins,omitempty"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.

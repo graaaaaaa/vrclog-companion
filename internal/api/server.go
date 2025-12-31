@@ -20,6 +20,7 @@ type Server struct {
 	events app.EventsUsecase
 	state  app.StateUsecase
 	cfg    app.ConfigUsecase
+	stats  app.StatsUsecase
 
 	// SSE hub
 	hub *Hub
@@ -37,6 +38,12 @@ type Server struct {
 
 	// Rate limiter (LAN mode only)
 	rateLimiter *RateLimiter
+
+	// CORS configuration
+	corsConfig *CORSConfig
+
+	// CSRF allowed hosts (derived from server address)
+	csrfAllowedHosts []string
 }
 
 // ServerOption configures a Server.
@@ -55,6 +62,11 @@ func WithStateUsecase(state app.StateUsecase) ServerOption {
 // WithConfigUsecase sets the config use case.
 func WithConfigUsecase(cfg app.ConfigUsecase) ServerOption {
 	return func(s *Server) { s.cfg = cfg }
+}
+
+// WithStatsUsecase sets the stats use case.
+func WithStatsUsecase(stats app.StatsUsecase) ServerOption {
+	return func(s *Server) { s.stats = stats }
 }
 
 // WithHub sets the SSE hub.
@@ -88,17 +100,28 @@ func WithRateLimiter(rl *RateLimiter) ServerOption {
 	return func(s *Server) { s.rateLimiter = rl }
 }
 
+// WithCORS enables CORS with the specified configuration.
+func WithCORS(cfg CORSConfig) ServerOption {
+	return func(s *Server) { s.corsConfig = &cfg }
+}
+
+// WithCSRFAllowedHosts sets the allowed hosts for CSRF validation.
+func WithCSRFAllowedHosts(hosts []string) ServerOption {
+	return func(s *Server) { s.csrfAllowedHosts = hosts }
+}
+
 // NewServer creates a new API server with the given dependencies.
 func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
 		httpServer: &http.Server{
 			Addr:              addr,
-			Handler:           securityHeadersMiddleware(mux), // Apply security headers to all responses
+			Handler:           nil, // Set after options are applied
 			ReadHeaderTimeout: 5 * time.Second,                // Slowloris protection
 			ReadTimeout:       10 * time.Second,               // Total body read timeout
 			WriteTimeout:      0,                              // Disable for SSE (long-lived connections)
 			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 14, // 16KB - limit header size to prevent DoS
 		},
 		mux:    mux,
 		health: health,
@@ -107,6 +130,24 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 		opt(s)
 	}
 	s.registerRoutes()
+
+	// Build middleware chain: security headers -> CORS -> CSRF -> mux
+	var handler http.Handler = mux
+
+	// Apply CSRF protection for state-changing requests
+	if len(s.csrfAllowedHosts) > 0 {
+		handler = csrfMiddleware(s.csrfAllowedHosts)(handler)
+	}
+
+	// Apply CORS if configured
+	if s.corsConfig != nil {
+		handler = corsMiddleware(*s.corsConfig)(handler)
+	}
+
+	// Apply security headers (always)
+	handler = securityHeadersMiddleware(handler)
+
+	s.httpServer.Handler = handler
 	return s
 }
 
@@ -150,6 +191,11 @@ func (s *Server) registerRoutes() {
 	// Now endpoint (auth required if configured)
 	if s.state != nil {
 		s.mux.Handle("GET /api/v1/now", s.wrapAuth(http.HandlerFunc(s.handleNow)))
+	}
+
+	// Stats endpoint (auth required if configured)
+	if s.stats != nil {
+		s.mux.Handle("GET /api/v1/stats/basic", s.wrapAuth(http.HandlerFunc(s.handleStats)))
 	}
 
 	// SSE stream endpoint (auth required if configured, accepts token auth)
