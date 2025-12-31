@@ -6,10 +6,25 @@ import (
 	"errors"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 )
 
 // CurrentSchemaVersion is the current config schema version.
 const CurrentSchemaVersion = 1
+
+// Environment variable names for config overrides.
+// Priority: Environment > Config File > Default
+const (
+	EnvPort              = "VRCLOG_PORT"
+	EnvLanEnabled        = "VRCLOG_LAN_ENABLED"
+	EnvLogPath           = "VRCLOG_LOG_PATH"
+	EnvDiscordBatchSec   = "VRCLOG_DISCORD_BATCH_SEC"
+	EnvAutoStart         = "VRCLOG_AUTO_START"
+	EnvNotifyOnJoin      = "VRCLOG_NOTIFY_ON_JOIN"
+	EnvNotifyOnLeave     = "VRCLOG_NOTIFY_ON_LEAVE"
+	EnvNotifyOnWorldJoin = "VRCLOG_NOTIFY_ON_WORLD_JOIN"
+)
 
 // Config holds non-sensitive application configuration.
 type Config struct {
@@ -120,4 +135,62 @@ func SaveConfigTo(cfg Config, path string) error {
 	cfg.SchemaVersion = CurrentSchemaVersion
 
 	return writeJSONAtomic(path, cfg)
+}
+
+// ApplyEnvOverrides applies environment variable overrides to the config.
+// Environment variables take highest priority over config file values.
+func ApplyEnvOverrides(cfg Config) Config {
+	// Port
+	if v := os.Getenv(EnvPort); v != "" {
+		if port, err := strconv.Atoi(v); err == nil && port > 0 && port <= 65535 {
+			cfg.Port = port
+		}
+	}
+
+	// LAN enabled
+	if v := os.Getenv(EnvLanEnabled); v != "" {
+		cfg.LanEnabled = parseBool(v)
+	}
+
+	// Log path
+	if v := os.Getenv(EnvLogPath); v != "" {
+		cfg.LogPath = v
+	}
+
+	// Discord batch seconds
+	if v := os.Getenv(EnvDiscordBatchSec); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec >= 0 {
+			cfg.DiscordBatchSec = sec
+		}
+	}
+
+	// Auto start
+	if v := os.Getenv(EnvAutoStart); v != "" {
+		cfg.AutoStartEnabled = parseBool(v)
+	}
+
+	// Notify on join
+	if v := os.Getenv(EnvNotifyOnJoin); v != "" {
+		cfg.NotifyOnJoin = parseBool(v)
+	}
+
+	// Notify on leave
+	if v := os.Getenv(EnvNotifyOnLeave); v != "" {
+		cfg.NotifyOnLeave = parseBool(v)
+	}
+
+	// Notify on world join
+	if v := os.Getenv(EnvNotifyOnWorldJoin); v != "" {
+		cfg.NotifyOnWorldJoin = parseBool(v)
+	}
+
+	return cfg
+}
+
+// parseBool parses a boolean from various string representations.
+// Accepts: "true", "1", "yes", "on" (case-insensitive) as true.
+// All other values are treated as false.
+func parseBool(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "true" || s == "1" || s == "yes" || s == "on"
 }

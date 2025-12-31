@@ -176,6 +176,128 @@ func TestSecret_IsEmpty(t *testing.T) {
 	}
 }
 
+func TestApplyEnvOverrides_Port(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// Set env var
+	os.Setenv(EnvPort, "9999")
+	defer os.Unsetenv(EnvPort)
+
+	cfg = ApplyEnvOverrides(cfg)
+
+	if cfg.Port != 9999 {
+		t.Errorf("expected port 9999, got %d", cfg.Port)
+	}
+}
+
+func TestApplyEnvOverrides_LanEnabled(t *testing.T) {
+	tests := []struct {
+		envValue string
+		expected bool
+	}{
+		{"true", true},
+		{"TRUE", true},
+		{"1", true},
+		{"yes", true},
+		{"on", true},
+		{"false", false},
+		{"0", false},
+		{"no", false},
+		{"off", false},
+		{"invalid", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.envValue, func(t *testing.T) {
+			cfg := DefaultConfig()
+			os.Setenv(EnvLanEnabled, tt.envValue)
+			defer os.Unsetenv(EnvLanEnabled)
+
+			cfg = ApplyEnvOverrides(cfg)
+
+			if cfg.LanEnabled != tt.expected {
+				t.Errorf("for %q: expected LanEnabled=%v, got %v", tt.envValue, tt.expected, cfg.LanEnabled)
+			}
+		})
+	}
+}
+
+func TestApplyEnvOverrides_InvalidPort(t *testing.T) {
+	cfg := DefaultConfig()
+	originalPort := cfg.Port
+
+	// Set invalid port
+	os.Setenv(EnvPort, "not-a-number")
+	defer os.Unsetenv(EnvPort)
+
+	cfg = ApplyEnvOverrides(cfg)
+
+	// Should keep original value
+	if cfg.Port != originalPort {
+		t.Errorf("expected port to remain %d with invalid env, got %d", originalPort, cfg.Port)
+	}
+}
+
+func TestApplyEnvOverrides_LogPath(t *testing.T) {
+	cfg := DefaultConfig()
+
+	os.Setenv(EnvLogPath, "/custom/log/path")
+	defer os.Unsetenv(EnvLogPath)
+
+	cfg = ApplyEnvOverrides(cfg)
+
+	if cfg.LogPath != "/custom/log/path" {
+		t.Errorf("expected log path '/custom/log/path', got '%s'", cfg.LogPath)
+	}
+}
+
+func TestApplyEnvOverrides_AllBooleans(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// Set all boolean env vars
+	os.Setenv(EnvAutoStart, "true")
+	os.Setenv(EnvNotifyOnJoin, "false")
+	os.Setenv(EnvNotifyOnLeave, "1")
+	os.Setenv(EnvNotifyOnWorldJoin, "no")
+	defer func() {
+		os.Unsetenv(EnvAutoStart)
+		os.Unsetenv(EnvNotifyOnJoin)
+		os.Unsetenv(EnvNotifyOnLeave)
+		os.Unsetenv(EnvNotifyOnWorldJoin)
+	}()
+
+	cfg = ApplyEnvOverrides(cfg)
+
+	if !cfg.AutoStartEnabled {
+		t.Error("AutoStartEnabled should be true")
+	}
+	if cfg.NotifyOnJoin {
+		t.Error("NotifyOnJoin should be false")
+	}
+	if !cfg.NotifyOnLeave {
+		t.Error("NotifyOnLeave should be true")
+	}
+	if cfg.NotifyOnWorldJoin {
+		t.Error("NotifyOnWorldJoin should be false")
+	}
+}
+
+func TestParseBool(t *testing.T) {
+	trueValues := []string{"true", "TRUE", "True", "1", "yes", "YES", "on", "ON", " true ", " 1 "}
+	for _, v := range trueValues {
+		if !parseBool(v) {
+			t.Errorf("parseBool(%q) should be true", v)
+		}
+	}
+
+	falseValues := []string{"false", "FALSE", "0", "no", "off", "", "invalid", "anything"}
+	for _, v := range falseValues {
+		if parseBool(v) {
+			t.Errorf("parseBool(%q) should be false", v)
+		}
+	}
+}
+
 func TestSaveLoadSecrets_RoundTrip(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "secrets.json")
