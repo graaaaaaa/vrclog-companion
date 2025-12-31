@@ -74,7 +74,7 @@ cmd/vrclog/main.go
 ### API Package Structure
 
 The `internal/api` package provides HTTP server with SSE support:
-- `server.go` - Server with ServerOption pattern, route registration
+- `server.go` - Server with ServerOption pattern, route registration, `wrapAuth()` helper
 - `hub.go` - SSE Hub (1 goroutine + channel management, no mutex)
 - `events.go` - GET /api/v1/events handler with cursor pagination
 - `stream.go` - GET /api/v1/stream SSE handler with Last-Event-ID replay
@@ -88,6 +88,7 @@ Key features:
 - Last-Event-ID replay limited to 5 pages (500 events) best-effort
 - Heartbeat every 20 seconds (`":\n\n"`) to prevent proxy timeouts
 - Hub.Stop is idempotent (uses sync.Once)
+- `wrapAuth()` centralizes auth middleware wrapping for protected routes
 
 ### Store Package Structure
 
@@ -151,6 +152,21 @@ Key features:
 - Best-effort flush on shutdown
 - AfterFunc injection for deterministic batch tests
 
+### Config Package Structure
+
+The `internal/config` package handles configuration and secrets:
+- `config.go` - LoadConfig/SaveConfig with schema versioning
+- `secrets.go` - Secrets with `Secret` type, safe loading with `SecretsLoadStatus`
+- `paths.go` - Platform-specific data directory resolution
+- `atomic.go` - Atomic file writes (tmp→rename on POSIX, MoveFileEx on Windows)
+
+Key features:
+- `SecretsLoadStatus` enum (`SecretsLoaded`, `SecretsMissing`, `SecretsFallback`) prevents accidental overwrite on parse errors
+- `Secret` type with `String()` returning `[REDACTED]` for log safety
+- `WritePasswordFile()` saves generated credentials to file (not logged to stdout)
+- `EnsureLanAuth()` auto-generates strong password when LAN mode enabled
+- Schema versioning with forward-compatible defaults
+
 ### Key Design Decisions
 
 - **Deduplication**: `dedupe_key = SHA256(raw_line)` with UNIQUE constraint, ON CONFLICT DO NOTHING
@@ -161,7 +177,7 @@ Key features:
 - **Config location**: `%LOCALAPPDATA%/vrclog/` on Windows, `~/.config/vrclog/` on other platforms
 - **Atomic writes**: Config files use tmp→rename (POSIX) or MoveFileEx (Windows)
 - **Single instance**: Windows uses CreateMutex (session-scoped), macOS is no-op for development
-- **Secrets masking**: `Secret` type with `String()` returning `[REDACTED]` for log safety
+- **Secrets safety**: `SecretsLoadStatus` prevents overwriting corrupted secrets files
 - **Config resilience**: Corrupt/missing config falls back to defaults with warning (non-fatal)
 - **Clock injection**: `Clock` interface in `ingest/convert.go` allows deterministic time testing
 - **Nil-channel pattern**: Both `vrclog_source.go` and `ingest.go` use nil-channel pattern to handle independent channel closures without losing events
