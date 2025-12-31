@@ -121,12 +121,12 @@ WHERE 1=1
 		if err != nil {
 			return QueryResult{}, fmt.Errorf("decode cursor: %w", err)
 		}
-		sb.WriteString(" AND (ts > ? OR (ts = ? AND id > ?))")
+		sb.WriteString(" AND (ts < ? OR (ts = ? AND id < ?))")
 		cursorTimeStr := cursorTime.UTC().Format(TimeFormat)
 		args = append(args, cursorTimeStr, cursorTimeStr, cursorID)
 	}
 
-	sb.WriteString(" ORDER BY ts ASC, id ASC")
+	sb.WriteString(" ORDER BY ts DESC, id DESC")
 	sb.WriteString(" LIMIT ?")
 	args = append(args, limit+1) // fetch one extra to detect next page
 
