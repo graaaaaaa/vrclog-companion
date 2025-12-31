@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +14,10 @@ import (
 )
 
 const (
-	passwordLength  = 24
-	passwordCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	defaultUsername = "admin"
+	passwordLength   = 24
+	passwordCharset  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	defaultUsername  = "admin"
+	sseSecretLength  = 32 // 256 bits for HMAC-SHA256
 )
 
 // SecretsLoadStatus indicates how secrets were loaded.
@@ -62,6 +64,7 @@ type Secrets struct {
 	DiscordWebhookURL Secret `json:"discord_webhook_url"`
 	BasicAuthUsername string `json:"basic_auth_username"`
 	BasicAuthPassword Secret `json:"basic_auth_password"`
+	SSEHMACSecret     Secret `json:"sse_hmac_secret"` // HMAC key for SSE token signing
 }
 
 // DefaultSecrets returns a Secrets with empty values.
@@ -71,6 +74,7 @@ func DefaultSecrets() Secrets {
 		DiscordWebhookURL: "",
 		BasicAuthUsername: "",
 		BasicAuthPassword: "",
+		SSEHMACSecret:     "",
 	}
 }
 
@@ -191,4 +195,29 @@ func WritePasswordFile(username, password string) (string, error) {
 		return "", fmt.Errorf("write password file: %w", err)
 	}
 	return path, nil
+}
+
+// GenerateSSESecret generates a cryptographically secure random secret for SSE token signing.
+// Returns a base64url-encoded 32-byte secret (no padding).
+func GenerateSSESecret() (string, error) {
+	buf := make([]byte, sseSecretLength)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate sse secret: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// EnsureSSESecret ensures SSE HMAC secret exists.
+// Returns (updated bool, error).
+func EnsureSSESecret(s *Secrets) (updated bool, err error) {
+	if !s.SSEHMACSecret.IsEmpty() {
+		return false, nil
+	}
+
+	secret, err := GenerateSSESecret()
+	if err != nil {
+		return false, err
+	}
+	s.SSEHMACSecret = Secret(secret)
+	return true, nil
 }

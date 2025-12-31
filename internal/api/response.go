@@ -7,6 +7,11 @@ import (
 	"net/http"
 )
 
+// errorResponse is the standard error response format.
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
 // writeJSON encodes v as JSON and writes it to the response.
 // It buffers the encoding to detect errors before writing headers.
 func writeJSON(w http.ResponseWriter, status int, v any) {
