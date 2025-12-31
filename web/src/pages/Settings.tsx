@@ -16,6 +16,8 @@ function Settings() {
   const [notifyOnLeave, setNotifyOnLeave] = useState(true)
   const [notifyOnWorldJoin, setNotifyOnWorldJoin] = useState(true)
   const [discordWebhookUrl, setDiscordWebhookUrl] = useState('')
+  const [logPath, setLogPath] = useState('')
+  const [newPassword, setNewPassword] = useState('')
 
   useEffect(() => {
     apiClient
@@ -28,6 +30,7 @@ function Settings() {
         setNotifyOnJoin(data.notify_on_join)
         setNotifyOnLeave(data.notify_on_leave)
         setNotifyOnWorldJoin(data.notify_on_world_join)
+        setLogPath(data.log_path)
         setLoading(false)
       })
       .catch((err) => {
@@ -50,6 +53,7 @@ function Settings() {
         notify_on_join: notifyOnJoin,
         notify_on_leave: notifyOnLeave,
         notify_on_world_join: notifyOnWorldJoin,
+        log_path: logPath,
       }
 
       // Only include webhook URL if changed
@@ -57,11 +61,17 @@ function Settings() {
         req.discord_webhook_url = discordWebhookUrl
       }
 
+      // Only include password if changed
+      if (newPassword) {
+        req.basic_auth_password = newPassword
+      }
+
       const res = await apiClient.updateConfig(req)
 
       if (res.success) {
         setSuccess('Settings saved. Restart required to apply changes.')
         setDiscordWebhookUrl('') // Clear webhook URL field after save
+        setNewPassword('') // Clear password field after save
         if (res.new_port && res.new_port !== port) {
           setSuccess(
             `Settings saved. Restart required. New port: ${res.new_port}`
@@ -163,6 +173,72 @@ function Settings() {
               </div>
             </div>
           )}
+        </div>
+
+        {/* Log Settings */}
+        <div className="bg-white rounded-lg shadow p-4 space-y-4">
+          <h2 className="text-lg font-semibold text-gray-800">Log Settings</h2>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              VRChat Log Path
+            </label>
+            <input
+              type="text"
+              value={logPath}
+              onChange={(e) => setLogPath(e.target.value)}
+              placeholder="Leave empty for auto-detect"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500 font-mono text-sm"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Path to VRChat log directory. Leave empty to auto-detect default location.
+            </p>
+          </div>
+        </div>
+
+        {/* Authentication Settings */}
+        <div className="bg-white rounded-lg shadow p-4 space-y-4">
+          <h2 className="text-lg font-semibold text-gray-800">Authentication</h2>
+
+          {config?.basic_auth_configured ? (
+            <div className="text-sm text-green-600 flex items-center gap-2">
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                <path
+                  fillRule="evenodd"
+                  d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
+                  clipRule="evenodd"
+                />
+              </svg>
+              Basic Auth configured (username: {config?.basic_auth_username || 'admin'})
+            </div>
+          ) : (
+            <div className="text-sm text-yellow-600 flex items-center gap-2">
+              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                <path
+                  fillRule="evenodd"
+                  d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
+                  clipRule="evenodd"
+                />
+              </svg>
+              No auth configured. Set password to enable LAN mode securely.
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              {config?.basic_auth_configured ? 'Change Password' : 'Set Password'}
+            </label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder={config?.basic_auth_configured ? 'Enter new password to change' : 'Enter password'}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Password for Basic Auth. Required when LAN mode is enabled.
+            </p>
+          </div>
         </div>
 
         {/* Discord Settings */}

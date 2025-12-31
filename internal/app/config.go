@@ -20,13 +20,16 @@ type ConfigUsecase interface {
 
 // ConfigResponse represents the current configuration (excludes secret values).
 type ConfigResponse struct {
-	Port                     int  `json:"port"`
-	LanEnabled               bool `json:"lan_enabled"`
-	DiscordBatchSec          int  `json:"discord_batch_sec"`
-	NotifyOnJoin             bool `json:"notify_on_join"`
-	NotifyOnLeave            bool `json:"notify_on_leave"`
-	NotifyOnWorldJoin        bool `json:"notify_on_world_join"`
-	DiscordWebhookConfigured bool `json:"discord_webhook_configured"`
+	Port                     int    `json:"port"`
+	LanEnabled               bool   `json:"lan_enabled"`
+	DiscordBatchSec          int    `json:"discord_batch_sec"`
+	NotifyOnJoin             bool   `json:"notify_on_join"`
+	NotifyOnLeave            bool   `json:"notify_on_leave"`
+	NotifyOnWorldJoin        bool   `json:"notify_on_world_join"`
+	DiscordWebhookConfigured bool   `json:"discord_webhook_configured"`
+	LogPath                  string `json:"log_path"`
+	BasicAuthUsername        string `json:"basic_auth_username,omitempty"`
+	BasicAuthConfigured      bool   `json:"basic_auth_configured"`
 }
 
 // ConfigUpdateRequest contains optional fields for updating configuration.
@@ -38,6 +41,8 @@ type ConfigUpdateRequest struct {
 	NotifyOnLeave     *bool   `json:"notify_on_leave,omitempty"`
 	NotifyOnWorldJoin *bool   `json:"notify_on_world_join,omitempty"`
 	DiscordWebhookURL *string `json:"discord_webhook_url,omitempty"`
+	LogPath           *string `json:"log_path,omitempty"`
+	BasicAuthPassword *string `json:"basic_auth_password,omitempty"`
 }
 
 // ConfigUpdateResponse indicates the result of a configuration update.
@@ -66,6 +71,9 @@ func (s ConfigService) GetConfig(ctx context.Context) ConfigResponse {
 		NotifyOnLeave:            cfg.NotifyOnLeave,
 		NotifyOnWorldJoin:        cfg.NotifyOnWorldJoin,
 		DiscordWebhookConfigured: !sec.DiscordWebhookURL.IsEmpty(),
+		LogPath:                  cfg.LogPath,
+		BasicAuthUsername:        sec.BasicAuthUsername,
+		BasicAuthConfigured:      !sec.BasicAuthPassword.IsEmpty(),
 	}
 }
 
@@ -118,6 +126,10 @@ func (s ConfigService) UpdateConfig(ctx context.Context, req ConfigUpdateRequest
 		cfg.NotifyOnWorldJoin = *req.NotifyOnWorldJoin
 		configChanged = true
 	}
+	if req.LogPath != nil {
+		cfg.LogPath = *req.LogPath
+		configChanged = true
+	}
 
 	// Apply updates to secrets
 	if req.DiscordWebhookURL != nil {
@@ -127,6 +139,17 @@ func (s ConfigService) UpdateConfig(ctx context.Context, req ConfigUpdateRequest
 		}
 		sec.DiscordWebhookURL = config.Secret(url)
 		secretsChanged = true
+	}
+	if req.BasicAuthPassword != nil {
+		pw := *req.BasicAuthPassword
+		if pw != "" {
+			sec.BasicAuthPassword = config.Secret(pw)
+			// Ensure username exists
+			if sec.BasicAuthUsername == "" {
+				sec.BasicAuthUsername = "admin"
+			}
+			secretsChanged = true
+		}
 	}
 
 	// Save config if changed
