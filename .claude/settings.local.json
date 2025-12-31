@@ -6,7 +6,19 @@
       "Bash(go mod init:*)",
       "Bash(go test:*)",
       "Bash(go build:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "mcp__gemini-google-search__google_search",
+      "Bash(GOOS=windows GOARCH=amd64 go build:*)",
+      "Bash(go get:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(ls:*)",
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(git commit:*)",
+      "Bash(npm install)",
+      "mcp__codex__codex-reply",
+      "Bash(npm run build:*)"
     ]
   }
 }
