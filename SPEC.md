@@ -136,7 +136,7 @@ VRChat のローカルログを監視し、Join/Leave/World移動等のイベン
 ## 6.4 HTTP API
 
 * prefix：`/api/v1`
-* `health` / `state` / `events` / `stats/basic` / `stream(SSE)`
+* `health` / `now` / `events` / `stats/basic` / `stream(SSE)` / `auth/token` / `config`
 
 ## 6.5 Web UI（ブラウザのみ）
 
@@ -372,8 +372,13 @@ VRChat のローカルログを監視し、Join/Leave/World移動等のイベン
 * `event:` はイベント種別（`player_join`, `player_left`, `world_join`）
 * `data:` はイベントJSON
 * 切断時に購読解除
-* `Last-Event-ID` ヘッダでの再接続リプレイ対応
+* `Last-Event-ID` ヘッダまたは `last_event_id` クエリパラメータでの再接続リプレイ対応
 * ハートビート: 20秒間隔でコメント送信
+
+認証（LAN公開時）:
+* Basic認証ヘッダ、または
+* `?token=...` クエリパラメータ（`POST /api/v1/auth/token` で発行）
+* ブラウザの `EventSource` API は Basic認証ヘッダを送信できないため、トークン認証を使用
 
 ### 12.6 `POST /api/v1/auth/token`
 

@@ -17,7 +17,7 @@ See [SPEC.md](./SPEC.md) for detailed specifications.
 ## Requirements
 
 - Go 1.25+
-- Node.js 18+ (for Web UI build)
+- Node.js 20+ (for Web UI build)
 - Windows 11 (target OS)
 
 ## Directory Structure
@@ -39,7 +39,8 @@ vrclog-companion/
 ├── webembed/            # Embedded Web UI
 ├── .github/
 │   └── workflows/
-│       └── ci.yml       # GitHub Actions CI
+│       ├── ci.yml       # GitHub Actions CI
+│       └── release.yml  # Release workflow
 ├── go.mod
 ├── SPEC.md              # Specification
 ├── LICENSE              # MIT License
@@ -53,7 +54,7 @@ vrclog-companion/
 ```bash
 # Build Web UI
 cd web && npm install && npm run build && cd ..
-cp -r web/dist/* webembed/
+cp -r web/dist/* webembed/dist/
 
 # Cross-compile for Windows (from macOS/Linux)
 GOOS=windows GOARCH=amd64 go build -o vrclog.exe ./cmd/vrclog
@@ -117,7 +118,7 @@ GitHub Actions runs tests automatically on Windows runners.
 Setting `lan_enabled=true` in `config.json` allows access from other devices on your local network.
 
 - **Basic Auth is required**: Basic Auth is automatically enabled when LAN mode is on
-- **Auto-generated password on first run**: If credentials are not configured, a strong random password is generated and displayed in the logs
+- **Auto-generated password on first run**: If credentials are not configured, a strong random password is generated and saved to `generated_password.txt` in the data directory
 
 ### Important Notes
 

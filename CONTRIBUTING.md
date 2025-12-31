@@ -4,8 +4,8 @@ Thank you for your interest in contributing to VRClog Companion!
 
 ## Prerequisites
 
-- Go 1.22 or later
-- Node.js 18 or later (for Web UI development)
+- Go 1.25 or later
+- Node.js 20 or later (for Web UI development)
 - Git
 
 ## Development Setup
@@ -31,7 +31,7 @@ Thank you for your interest in contributing to VRClog Companion!
 4. Build the Web UI:
    ```bash
    cd web && npm run build && cd ..
-   cp -r web/dist/* webembed/
+   cp -r web/dist/* webembed/dist/
    ```
 
 5. Run tests:
@@ -126,7 +126,7 @@ go test -tags=integration ./test/integration/...
 5. If you modified the Web UI, rebuild it:
    ```bash
    cd web && npm run build && cd ..
-   cp -r web/dist/* webembed/
+   cp -r web/dist/* webembed/dist/
    ```
 6. Push your branch and create a pull request
 7. Wait for CI to pass
