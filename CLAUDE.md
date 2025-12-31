@@ -8,34 +8,21 @@ VRClog Companion is a Windows local resident app that monitors VRChat logs, extr
 
 **Key principle**: No central server. All data stays on the user's PC only.
 
+## Tech Stack
+
+- Go 1.22+, SQLite (WAL mode), React + Vite (embedded via go:embed)
+- Target: Windows 11 (macOS supported for development)
+- Pure Go SQLite (modernc.org/sqlite, no CGO)
+
 ## Commands
 
 ```bash
-# Build (local)
-go build -o vrclog ./cmd/vrclog
-
-# Build for Windows (cross-compile) with version
-GOOS=windows GOARCH=amd64 go build -ldflags "-X github.com/graaaaa/vrclog-companion/internal/version.Version=0.1.0" -o vrclog.exe ./cmd/vrclog
-
-# Build with Web UI (production)
-cd web && npm install && npm run build && cd ..
-cp -r web/dist webembed/
-go build -o vrclog ./cmd/vrclog
-
-# Run tests
-go test ./...
-
-# Run single test
-go test -run TestInsertEvent_Dedupe ./internal/store
-
-# Run server (default port 8080)
-./vrclog
-
-# Run server with custom port
-./vrclog -port 9000
-
-# Frontend dev server (with API proxy to :8080)
-cd web && npm run dev
+go test ./...                                    # Run all tests
+go test -run TestName ./internal/store           # Run single test
+go test -tags=integration ./test/integration/... # Integration tests
+GOOS=windows GOARCH=amd64 go build -o vrclog.exe ./cmd/vrclog  # Windows build
+cd web && npm run build && cd .. && cp -r web/dist webembed/   # Build Web UI
+cd web && npm run dev                            # Frontend dev server (proxy to :8080)
 ```
 
 ## Architecture
@@ -47,178 +34,58 @@ VRChat Log → vrclog-go (parser) → Event → Dedupe Check → SQLite
                               (on new event only)
                               ├── Derive update (in-memory state)
                               ├── Discord notification
-                              └── SSE broadcast
-                                           ↓
-                              Web UI (React + Vite, embedded via go:embed)
+                              └── SSE broadcast → Web UI
 ```
 
 ### Internal Packages
 
 | Package | Purpose |
 |---------|---------|
-| `internal/api` | HTTP API server (JSON + SSE + Auth) |
+| `internal/api` | HTTP API server (JSON + SSE + Auth + Rate Limiting) |
 | `internal/app` | Use case layer (business logic interfaces) |
-| `internal/appinfo` | App identity constants (name, dir, mutex, filenames) |
 | `internal/config` | Config/secrets management with atomic writes |
 | `internal/derive` | In-memory state tracking (current world, online players) |
 | `internal/event` | Shared Event model (`*string` fields, JSON-ready) |
-| `internal/ingest` | Log monitoring via vrclog-go, event ingestion to SQLite |
-| `internal/notify` | Discord Webhook notifications with batching and backoff |
-| `internal/singleinstance` | Single instance control (Windows mutex, macOS no-op) |
-| `internal/store` | SQLite persistence (WAL mode, deduplication, cursor pagination) |
-| `internal/version` | Build version info (ldflags injection) |
-| `internal/api/sseauth` | SSE token generation/validation (HMAC-SHA256) |
+| `internal/ingest` | Log monitoring via vrclog-go, event ingestion |
+| `internal/notify` | Discord Webhook notifications with batching |
+| `internal/store` | SQLite persistence (WAL, deduplication, cursor pagination) |
 | `webembed` | Embedded web UI filesystem (go:embed) |
 
-### Dependency Injection Pattern
-
-```
-cmd/vrclog/main.go
-    └── builds dependencies (app.HealthService, etc.)
-    └── passes to api.NewServer(addr, health)
-            └── server calls health.Handle(ctx) via interface
-```
+### Dependency Injection
 
 - `internal/app` defines use case interfaces (e.g., `HealthUsecase`)
 - `internal/api` depends only on interfaces, not implementations
 - `cmd/vrclog/main.go` wires concrete implementations
 
-### API Package Structure
+## Claude Directives
 
-The `internal/api` package provides HTTP server with SSE support:
-- `server.go` - Server with ServerOption pattern, route registration, `wrapAuth()` helper
-- `hub.go` - SSE Hub (1 goroutine + channel management, no mutex)
-- `events.go` - GET /api/v1/events handler with cursor pagination
-- `stream.go` - GET /api/v1/stream SSE handler with Last-Event-ID replay
-- `middleware.go` - Basic Auth + SSE token middleware with SHA-256 constant-time comparison
-- `response.go` - JSON response helper
-- `now.go` - GET /api/v1/now handler
-- `auth.go` - POST /api/v1/auth/token handler
-- `config.go` - GET/PUT /api/v1/config handlers
-- `static.go` - SPA handler with index.html fallback
-- `sseauth/token.go` - HMAC-SHA256 token generation/validation
+- Clarify unknowns before starting implementation
+- Use `plan mode` for changes spanning 2+ files or design decisions
+- Always run `go test ./...` and `GOOS=windows go build ./...` before completing
+- Never log secrets - use `Secret` type with `[REDACTED]` output
+- Respect existing design patterns; minimize change scope
 
-Key features:
-- WriteTimeout=0 for SSE long-lived connections
-- Hub uses channel pattern (register/unregister/broadcast) for thread safety
-- SSE `id` field uses cursor format (`base64(ts|id)`) for direct QueryEvents compatibility
-- Last-Event-ID replay limited to 5 pages (500 events) best-effort
-- Heartbeat every 20 seconds (`":\n\n"`) to prevent proxy timeouts
-- Hub.Stop is idempotent (uses sync.Once)
-- `wrapAuth()` centralizes Basic Auth middleware, `wrapSSEAuth()` accepts token OR Basic Auth
-- SSE token: `sse1.<payload_b64>.<sig_b64>` format, 5min TTL, via `?token=xxx` query param
+## Workflow
 
-### App Package Structure
+- **Feature**: Explore → Plan → Code → Test → Commit
+- **Bug fix**: Reproduce → Diagnose → Fix → Test → Commit
 
-The `internal/app` package defines use case interfaces:
-- `health.go` - HealthUsecase interface and HealthService
-- `events.go` - EventsUsecase interface (wraps store.Store)
-- `state.go` - StateUsecase interface (wraps derive.State for current world/players)
-- `config.go` - ConfigUsecase interface (config get/update with validation)
+## Key Design Decisions
 
-### Store Package Structure
-
-The `internal/store` package separates concerns:
-- `store.go` - Open/Close, TimeFormat constant
-- `events.go` - InsertEvent, QueryEvents, GetLastEventTime, CountEvents
-- `parse_failures.go` - InsertParseFailure for logging parse errors
-- `cursor.go` - URL-safe base64 cursor encoding/decoding
-- `row.go` - DB row ↔ `event.Event` mapping, validation
-- `errors.go` - Typed errors (`ErrInvalidCursor`, `ErrInvalidEvent`)
-- `migrate.go` - Schema creation (events, ingest_cursor, parse_failures tables)
-
-### Ingest Package Structure
-
-The `internal/ingest` package handles log monitoring:
-- `source.go` - EventSource interface for testing abstraction
-- `vrclog_source.go` - vrclog-go watcher implementation with configurable buffer sizes
-- `convert.go` - Event conversion + SHA256 dedupe key + Clock interface
-- `ingest.go` - Ingester loop coordinating source → store
-- `replay.go` - Replay time calculation helper
-
-Key features:
-- On startup, replays events from (last_event_time - 5 min) via WithReplaySinceTime
-- Requires WithIncludeRawLine(true) for SHA256 dedupe key
-- Handles ParseError by saving to parse_failures table
-- Context cancellation stops watcher cleanly (no goroutine leaks)
-- Interface abstraction allows unit testing without vrclog-go dependency
-- Clock injection for deterministic testing (avoids time.Now() in tests)
-- Nil-channel pattern for independent channel closure handling
-- Configurable buffer sizes (default: event=64, error=16) to reduce DB backpressure
-- `OnInsertFunc` callback for triggering side effects (derive/notify) on new events
-
-### Derive Package Structure
-
-The `internal/derive` package manages ephemeral in-memory state:
-- `state.go` - State struct tracking current world and online players
-
-Key features:
-- Thread-safe via sync.RWMutex (API server and ingester may access concurrently)
-- Returns `DerivedEvent` indicating what changed (WorldChanged, PlayerJoined, PlayerLeft)
-- Clears player list on world change
-- Deduplicates player join events (same player joining twice returns nil)
-- Pure in-memory (no persistence, rebuilt on restart if needed)
-- PlayerID-first keying (falls back to PlayerName if ID empty) for rename tolerance
-
-### Notify Package Structure
-
-The `internal/notify` package handles Discord Webhook notifications:
-- `timer.go` - AfterFunc injection for testable batch timers
-- `backoff.go` - Exponential backoff calculation with jitter
-- `payload.go` - Discord embed payload builder
-- `sender.go` - Sender interface and DiscordSender implementation
-- `notifier.go` - Notifier with batching, filtering, and Run() loop
-
-Key features:
-- Configurable batch interval (`DiscordBatchSec`, default 3 seconds)
-- Notification filtering via `NotifyOnJoin/Leave/WorldJoin` config flags
-- Multiple events batched into single Discord request (up to 10 embeds)
-- Exponential backoff on 429/transient errors (1s initial, 5min max, 0.2 jitter)
-- Fatal stop on 401/403 (invalid webhook, stored in Status)
-- Best-effort flush on shutdown
-- AfterFunc injection for deterministic batch tests
-
-### Config Package Structure
-
-The `internal/config` package handles configuration and secrets:
-- `config.go` - LoadConfig/SaveConfig with schema versioning
-- `secrets.go` - Secrets with `Secret` type, safe loading with `SecretsLoadStatus`
-- `paths.go` - Platform-specific data directory resolution
-- `atomic.go` - Atomic file writes (tmp→rename on POSIX, MoveFileEx on Windows)
-
-Key features:
-- `SecretsLoadStatus` enum (`SecretsLoaded`, `SecretsMissing`, `SecretsFallback`) prevents accidental overwrite on parse errors
-- `Secret` type with `String()` returning `[REDACTED]` for log safety
-- `WritePasswordFile()` saves generated credentials to file (not logged to stdout)
-- `EnsureLanAuth()` auto-generates strong password when LAN mode enabled
-- `EnsureSSESecret()` auto-generates 32-byte HMAC secret for SSE tokens
-- Schema versioning with forward-compatible defaults
-
-### Key Design Decisions
-
-- **Deduplication**: `dedupe_key = SHA256(raw_line)` with UNIQUE constraint, ON CONFLICT DO NOTHING
-- **SQLite settings**: WAL mode, busy_timeout=5000ms, modernc.org/sqlite (pure Go, no CGO)
-- **Timestamps**: Fixed-width RFC3339 format (`2006-01-02T15:04:05.000000000Z`) for correct lexicographic ordering
-- **Cursor pagination**: URL-safe base64 (RawURLEncoding), backward compatible with StdEncoding
-- **Security defaults**: Binds to `127.0.0.1` by default. LAN mode requires Basic Auth
-- **Config location**: `%LOCALAPPDATA%/vrclog/` on Windows, `~/.config/vrclog/` on other platforms
 - **Atomic writes**: Config files use tmp→rename (POSIX) or MoveFileEx (Windows)
-- **Single instance**: Windows uses CreateMutex (session-scoped), macOS is no-op for development
+- **Single instance**: Windows uses CreateMutex (session-scoped)
+- **Security defaults**: Binds to `127.0.0.1` by default; LAN mode requires Basic Auth
 - **Secrets safety**: `SecretsLoadStatus` prevents overwriting corrupted secrets files
-- **Config resilience**: Corrupt/missing config falls back to defaults with warning (non-fatal)
-- **Clock injection**: `Clock` interface in `ingest/convert.go` allows deterministic time testing
-- **Nil-channel pattern**: Both `vrclog_source.go` and `ingest.go` use nil-channel pattern to handle independent channel closures without losing events
-- **SSE Token Auth**: Browser EventSource can't send headers, so `/api/v1/stream` accepts `?token=xxx` with HMAC-SHA256 signed tokens (separate `SSEHMACSecret` from BasicAuthPassword)
+- **Config resilience**: Corrupt/missing config falls back to defaults (non-fatal)
+- **Cursor pagination**: URL-safe base64 with backward compatibility
+- **Timestamps**: Fixed-width RFC3339 (`2006-01-02T15:04:05.000000000Z`) for lexicographic ordering
 
 ## Testing Patterns
 
-- **Interface abstraction**: `EventSource` interface allows mocking vrclog-go for unit tests
-- **Clock injection**: Use `WithClock(clock)` option to inject test clocks for deterministic timestamps
-- **Buffer configuration**: Use `WithEventBufferSize`/`WithErrorBufferSize` options to control channel throughput in tests
-- **Replay calculation**: Use `CalculateReplaySinceWithClock` for deterministic replay time tests
-- **Timer injection**: Use `WithAfterFunc(fakeAfterFunc)` in notify package for deterministic batch tests
-- **Mock sender**: `MockSender` in tests allows verifying Discord payloads without HTTP calls
-- **Fake timer handle**: `FakeTimerHandle` with `Fire()` method triggers batch flush synchronously
+- **Interface abstraction**: `EventSource` interface allows mocking vrclog-go
+- **Clock injection**: `WithClock()` option for deterministic timestamps
+- **Timer injection**: `WithAfterFunc()` for deterministic batch tests
+- **Integration tests**: `test/integration/` with `//go:build integration` tag
 
 ## API Routes
 
@@ -232,12 +99,6 @@ Key features:
 | GET | /api/v1/config | If LAN | Get config (secrets excluded) |
 | PUT | /api/v1/config | If LAN | Update config |
 
-Query parameters for `/api/v1/events`:
-- `since`, `until` - RFC3339 timestamps
-- `type` - `player_join`, `player_left`, `world_join`
-- `limit` - Max items per page
-- `cursor` - Pagination cursor from previous response
-
 ## PR Rules
 
 1. Keep PRs small
@@ -245,7 +106,7 @@ Query parameters for `/api/v1/events`:
 3. `GOOS=windows go build ./...` must pass
 4. Never log secrets (mask them)
 
-## Reference Documents
+## References
 
 - `SPEC.md` - Full specification
 - `docs/IMPLEMENTATION_PLAN.md` - Milestone breakdown
