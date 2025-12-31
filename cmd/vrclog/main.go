@@ -41,6 +41,8 @@ func main() {
 
 	// 2. Load configuration (corrupt config falls back to defaults with warning)
 	cfg, _ := config.LoadConfig()
+	// Apply environment variable overrides (highest priority)
+	cfg = config.ApplyEnvOverrides(cfg)
 	secrets, secretsStatus, err := config.LoadSecrets()
 	if err != nil {
 		log.Printf("Warning: %v", err)
@@ -101,6 +103,13 @@ func main() {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
+
+	// Run VACUUM if needed (every 30 days)
+	if vacuumed, err := db.VacuumIfNeeded(context.Background()); err != nil {
+		log.Printf("Warning: VACUUM check failed: %v", err)
+	} else if vacuumed {
+		log.Println("Database maintenance completed")
+	}
 
 	// 6. Create cancellable context for ingester
 	ctx, cancel := context.WithCancel(context.Background())
@@ -173,7 +182,7 @@ func main() {
 	addr := fmt.Sprintf("%s:%d", host, *port)
 
 	// Build dependencies
-	health := app.HealthService{Version: version.String()}
+	health := app.HealthService{Version: version.String(), DB: db}
 	eventsService := &app.EventsService{Store: db}
 	stateService := app.StateService{State: deriveState}
 
@@ -200,10 +209,16 @@ func main() {
 		log.Println("Web UI enabled")
 	}
 
-	// Enable Basic Auth for LAN mode (credentials are guaranteed by EnsureLanAuth)
+	// Enable Basic Auth and Rate Limiting for LAN mode
+	var rateLimiter *api.RateLimiter
 	if cfg.LanEnabled {
 		serverOpts = append(serverOpts, api.WithBasicAuth(secrets.BasicAuthUsername, secrets.BasicAuthPassword.Value()))
 		log.Println("Basic Auth enabled for LAN mode")
+
+		// Enable rate limiting for LAN mode
+		rateLimiter = api.NewRateLimiter(api.DefaultRateLimiterConfig())
+		serverOpts = append(serverOpts, api.WithRateLimiter(rateLimiter))
+		log.Println("Rate limiting enabled for LAN mode")
 	}
 
 	server := api.NewServer(addr, health, serverOpts...)
@@ -245,6 +260,11 @@ func main() {
 
 	// Stop SSE hub (closes all subscriber channels)
 	hub.Stop()
+
+	// Stop rate limiter cleanup goroutine
+	if rateLimiter != nil {
+		rateLimiter.Stop()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
