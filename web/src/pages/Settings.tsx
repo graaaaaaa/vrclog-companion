@@ -1,88 +1,155 @@
-import { useState, useEffect } from 'react'
+import { useReducer, useEffect } from 'react'
 import { apiClient, ConfigResponse } from '../api/client'
 
-function Settings() {
-  const [config, setConfig] = useState<ConfigResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [success, setSuccess] = useState<string | null>(null)
+// State types
+interface FormState {
+  port: number
+  lanEnabled: boolean
+  discordBatchSec: number
+  notifyOnJoin: boolean
+  notifyOnLeave: boolean
+  notifyOnWorldJoin: boolean
+  discordWebhookUrl: string
+  logPath: string
+  newPassword: string
+}
 
-  // Form state
-  const [port, setPort] = useState(8080)
-  const [lanEnabled, setLanEnabled] = useState(false)
-  const [discordBatchSec, setDiscordBatchSec] = useState(3)
-  const [notifyOnJoin, setNotifyOnJoin] = useState(true)
-  const [notifyOnLeave, setNotifyOnLeave] = useState(true)
-  const [notifyOnWorldJoin, setNotifyOnWorldJoin] = useState(true)
-  const [discordWebhookUrl, setDiscordWebhookUrl] = useState('')
-  const [logPath, setLogPath] = useState('')
-  const [newPassword, setNewPassword] = useState('')
+interface SettingsState {
+  config: ConfigResponse | null
+  loading: boolean
+  saving: boolean
+  error: string | null
+  success: string | null
+  form: FormState
+}
+
+// Action types
+type SettingsAction =
+  | { type: 'LOAD_START' }
+  | { type: 'LOAD_SUCCESS'; payload: ConfigResponse }
+  | { type: 'LOAD_ERROR'; payload: string }
+  | { type: 'SAVE_START' }
+  | { type: 'SAVE_SUCCESS'; payload: string }
+  | { type: 'SAVE_ERROR'; payload: string }
+  | { type: 'UPDATE_FORM'; payload: Partial<FormState> }
+  | { type: 'CLEAR_MESSAGES' }
+
+const initialFormState: FormState = {
+  port: 8080,
+  lanEnabled: false,
+  discordBatchSec: 3,
+  notifyOnJoin: true,
+  notifyOnLeave: true,
+  notifyOnWorldJoin: true,
+  discordWebhookUrl: '',
+  logPath: '',
+  newPassword: '',
+}
+
+const initialState: SettingsState = {
+  config: null,
+  loading: true,
+  saving: false,
+  error: null,
+  success: null,
+  form: initialFormState,
+}
+
+function settingsReducer(state: SettingsState, action: SettingsAction): SettingsState {
+  switch (action.type) {
+    case 'LOAD_START':
+      return { ...state, loading: true, error: null }
+    case 'LOAD_SUCCESS':
+      return {
+        ...state,
+        loading: false,
+        config: action.payload,
+        form: {
+          ...state.form,
+          port: action.payload.port,
+          lanEnabled: action.payload.lan_enabled,
+          discordBatchSec: action.payload.discord_batch_sec,
+          notifyOnJoin: action.payload.notify_on_join,
+          notifyOnLeave: action.payload.notify_on_leave,
+          notifyOnWorldJoin: action.payload.notify_on_world_join,
+          logPath: action.payload.log_path,
+        },
+      }
+    case 'LOAD_ERROR':
+      return { ...state, loading: false, error: action.payload }
+    case 'SAVE_START':
+      return { ...state, saving: true, error: null, success: null }
+    case 'SAVE_SUCCESS':
+      return {
+        ...state,
+        saving: false,
+        success: action.payload,
+        form: { ...state.form, discordWebhookUrl: '', newPassword: '' },
+      }
+    case 'SAVE_ERROR':
+      return { ...state, saving: false, error: action.payload }
+    case 'UPDATE_FORM':
+      return { ...state, form: { ...state.form, ...action.payload } }
+    case 'CLEAR_MESSAGES':
+      return { ...state, error: null, success: null }
+    default:
+      return state
+  }
+}
+
+function Settings() {
+  const [state, dispatch] = useReducer(settingsReducer, initialState)
+  const { config, loading, saving, error, success, form } = state
 
   useEffect(() => {
+    dispatch({ type: 'LOAD_START' })
     apiClient
       .fetchConfig()
-      .then((data) => {
-        setConfig(data)
-        setPort(data.port)
-        setLanEnabled(data.lan_enabled)
-        setDiscordBatchSec(data.discord_batch_sec)
-        setNotifyOnJoin(data.notify_on_join)
-        setNotifyOnLeave(data.notify_on_leave)
-        setNotifyOnWorldJoin(data.notify_on_world_join)
-        setLogPath(data.log_path)
-        setLoading(false)
-      })
-      .catch((err) => {
-        setError(err.message)
-        setLoading(false)
-      })
+      .then((data) => dispatch({ type: 'LOAD_SUCCESS', payload: data }))
+      .catch((err) => dispatch({ type: 'LOAD_ERROR', payload: err.message }))
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    setSaving(true)
-    setError(null)
-    setSuccess(null)
+    dispatch({ type: 'SAVE_START' })
 
     try {
       const req: Record<string, unknown> = {
-        port,
-        lan_enabled: lanEnabled,
-        discord_batch_sec: discordBatchSec,
-        notify_on_join: notifyOnJoin,
-        notify_on_leave: notifyOnLeave,
-        notify_on_world_join: notifyOnWorldJoin,
-        log_path: logPath,
+        port: form.port,
+        lan_enabled: form.lanEnabled,
+        discord_batch_sec: form.discordBatchSec,
+        notify_on_join: form.notifyOnJoin,
+        notify_on_leave: form.notifyOnLeave,
+        notify_on_world_join: form.notifyOnWorldJoin,
+        log_path: form.logPath,
       }
 
-      // Only include webhook URL if changed
-      if (discordWebhookUrl) {
-        req.discord_webhook_url = discordWebhookUrl
+      if (form.discordWebhookUrl) {
+        req.discord_webhook_url = form.discordWebhookUrl
       }
-
-      // Only include password if changed
-      if (newPassword) {
-        req.basic_auth_password = newPassword
+      if (form.newPassword) {
+        req.basic_auth_password = form.newPassword
       }
 
       const res = await apiClient.updateConfig(req)
 
       if (res.success) {
-        setSuccess('Settings saved. Restart required to apply changes.')
-        setDiscordWebhookUrl('') // Clear webhook URL field after save
-        setNewPassword('') // Clear password field after save
-        if (res.new_port && res.new_port !== port) {
-          setSuccess(
-            `Settings saved. Restart required. New port: ${res.new_port}`
-          )
+        let message = 'Settings saved. Restart required to apply changes.'
+        if (res.new_port && res.new_port !== form.port) {
+          message = `Settings saved. Restart required. New port: ${res.new_port}`
         }
+        dispatch({ type: 'SAVE_SUCCESS', payload: message })
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unknown error')
-    } finally {
-      setSaving(false)
+      dispatch({
+        type: 'SAVE_ERROR',
+        payload: err instanceof Error ? err.message : 'Unknown error',
+      })
     }
+  }
+
+  const updateForm = (updates: Partial<FormState>) => {
+    dispatch({ type: 'UPDATE_FORM', payload: updates })
   }
 
   if (loading) {
@@ -120,8 +187,8 @@ function Settings() {
               type="number"
               min="1"
               max="65535"
-              value={port}
-              onChange={(e) => setPort(parseInt(e.target.value) || 8080)}
+              value={form.port}
+              onChange={(e) => updateForm({ port: parseInt(e.target.value) || 8080 })}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
             />
             <p className="text-xs text-gray-500 mt-1">
@@ -133,8 +200,8 @@ function Settings() {
             <input
               type="checkbox"
               id="lanEnabled"
-              checked={lanEnabled}
-              onChange={(e) => setLanEnabled(e.target.checked)}
+              checked={form.lanEnabled}
+              onChange={(e) => updateForm({ lanEnabled: e.target.checked })}
               className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
             />
             <label htmlFor="lanEnabled" className="text-sm text-gray-700">
@@ -143,7 +210,7 @@ function Settings() {
           </div>
 
           {/* LAN Mode Warning */}
-          {lanEnabled && (
+          {form.lanEnabled && (
             <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
               <div className="flex items-start gap-2">
                 <svg
@@ -185,8 +252,8 @@ function Settings() {
             </label>
             <input
               type="text"
-              value={logPath}
-              onChange={(e) => setLogPath(e.target.value)}
+              value={form.logPath}
+              onChange={(e) => updateForm({ logPath: e.target.value })}
               placeholder="Leave empty for auto-detect"
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500 font-mono text-sm"
             />
@@ -230,8 +297,8 @@ function Settings() {
             </label>
             <input
               type="password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
+              value={form.newPassword}
+              onChange={(e) => updateForm({ newPassword: e.target.value })}
               placeholder={config?.basic_auth_configured ? 'Enter new password to change' : 'Enter password'}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
             />
@@ -251,8 +318,8 @@ function Settings() {
             </label>
             <input
               type="url"
-              value={discordWebhookUrl}
-              onChange={(e) => setDiscordWebhookUrl(e.target.value)}
+              value={form.discordWebhookUrl}
+              onChange={(e) => updateForm({ discordWebhookUrl: e.target.value })}
               placeholder={
                 config?.discord_webhook_configured
                   ? '(Webhook configured - enter new URL to change)'
@@ -272,8 +339,8 @@ function Settings() {
             <input
               type="number"
               min="0"
-              value={discordBatchSec}
-              onChange={(e) => setDiscordBatchSec(parseInt(e.target.value) || 0)}
+              value={form.discordBatchSec}
+              onChange={(e) => updateForm({ discordBatchSec: parseInt(e.target.value) || 0 })}
               className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
             />
             <p className="text-xs text-gray-500 mt-1">
@@ -287,8 +354,8 @@ function Settings() {
               <input
                 type="checkbox"
                 id="notifyOnJoin"
-                checked={notifyOnJoin}
-                onChange={(e) => setNotifyOnJoin(e.target.checked)}
+                checked={form.notifyOnJoin}
+                onChange={(e) => updateForm({ notifyOnJoin: e.target.checked })}
                 className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
               />
               <label htmlFor="notifyOnJoin" className="text-sm text-gray-700">
@@ -299,8 +366,8 @@ function Settings() {
               <input
                 type="checkbox"
                 id="notifyOnLeave"
-                checked={notifyOnLeave}
-                onChange={(e) => setNotifyOnLeave(e.target.checked)}
+                checked={form.notifyOnLeave}
+                onChange={(e) => updateForm({ notifyOnLeave: e.target.checked })}
                 className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
               />
               <label htmlFor="notifyOnLeave" className="text-sm text-gray-700">
@@ -311,8 +378,8 @@ function Settings() {
               <input
                 type="checkbox"
                 id="notifyOnWorldJoin"
-                checked={notifyOnWorldJoin}
-                onChange={(e) => setNotifyOnWorldJoin(e.target.checked)}
+                checked={form.notifyOnWorldJoin}
+                onChange={(e) => updateForm({ notifyOnWorldJoin: e.target.checked })}
                 className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
               />
               <label htmlFor="notifyOnWorldJoin" className="text-sm text-gray-700">

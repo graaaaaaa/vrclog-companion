@@ -28,6 +28,7 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
   const tokenRefreshTimerRef = useRef<number | null>(null)
   const reconnectTimerRef = useRef<number | null>(null)
   const backoffRef = useRef(INITIAL_BACKOFF)
+  const lastEventIdRef = useRef<string | null>(null)
 
   const cleanup = useCallback(() => {
     if (eventSourceRef.current) {
@@ -78,8 +79,12 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
     // Resync state before connecting
     await resync()
 
-    // Connect to SSE with token
-    const url = `/api/v1/stream?token=${encodeURIComponent(tokenRef.current!)}`
+    // Build SSE URL with token and optional last_event_id for reconnection
+    const params = new URLSearchParams({ token: tokenRef.current! })
+    if (lastEventIdRef.current) {
+      params.set('last_event_id', lastEventIdRef.current)
+    }
+    const url = `/api/v1/stream?${params.toString()}`
     const es = new EventSource(url)
     eventSourceRef.current = es
 
@@ -99,7 +104,12 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
       }, TOKEN_REFRESH_INTERVAL)
     }
 
-    es.onmessage = (msg) => {
+    // Handle incoming events and track lastEventId for reconnection
+    const handleEvent = (msg: MessageEvent) => {
+      // Save lastEventId for reconnection support
+      if (msg.lastEventId) {
+        lastEventIdRef.current = msg.lastEventId
+      }
       try {
         const event = JSON.parse(msg.data) as Event
         onEvent?.(event)
@@ -107,6 +117,11 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
         console.error('Failed to parse SSE message:', err)
       }
     }
+
+    // Register for specific event types (server sends event: <type>)
+    es.addEventListener('player_join', handleEvent)
+    es.addEventListener('player_left', handleEvent)
+    es.addEventListener('world_join', handleEvent)
 
     es.onerror = () => {
       setConnected(false)
