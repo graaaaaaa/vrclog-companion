@@ -36,8 +36,8 @@ func TestHealthEndpoint(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if resp.Status != "ok" {
-		t.Errorf("expected status 'ok', got '%s'", resp.Status)
+	if resp.Status != "healthy" {
+		t.Errorf("expected status 'healthy', got '%s'", resp.Status)
 	}
 
 	if resp.Version != "test-version" {

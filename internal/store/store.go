@@ -59,6 +59,12 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Ping checks if the database connection is healthy.
+// Implements app.HealthChecker interface.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 // journalMode returns the current journal mode (for testing).
 func (s *Store) journalMode() (string, error) {
 	var mode string

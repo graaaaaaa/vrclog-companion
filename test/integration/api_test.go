@@ -34,8 +34,8 @@ func TestHealthEndpoint(t *testing.T) {
 		t.Fatalf("failed to parse JSON: %v", err)
 	}
 
-	if result["status"] != "ok" {
-		t.Errorf("expected status 'ok', got %v", result["status"])
+	if result["status"] != "healthy" {
+		t.Errorf("expected status 'healthy', got %v", result["status"])
 	}
 }
 
