@@ -22,7 +22,10 @@
       "Bash(go clean:*)",
       "Bash(npm test:*)",
       "Bash(gh run:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(gh release:*)",
+      "Bash(git tag:*)",
+      "WebSearch"
     ]
   }
 }
