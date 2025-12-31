@@ -24,6 +24,7 @@ import (
 	"github.com/graaaaa/vrclog-companion/internal/singleinstance"
 	"github.com/graaaaa/vrclog-companion/internal/store"
 	"github.com/graaaaa/vrclog-companion/internal/version"
+	"github.com/graaaaa/vrclog-companion/webembed"
 )
 
 func main() {
@@ -50,6 +51,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to ensure LAN auth: %v", err)
 	}
+
+	// Ensure SSE secret exists (always needed for token generation)
+	sseUpdated, err := config.EnsureSSESecret(&secrets)
+	if err != nil {
+		log.Fatalf("Failed to ensure SSE secret: %v", err)
+	}
+	updated = updated || sseUpdated
 
 	// Only save if loaded successfully or file was missing (prevent overwrite on fallback)
 	if updated && secretsStatus != config.SecretsFallback {
@@ -167,11 +175,29 @@ func main() {
 	// Build dependencies
 	health := app.HealthService{Version: version.String()}
 	eventsService := &app.EventsService{Store: db}
+	stateService := app.StateService{State: deriveState}
+
+	// Get config paths for ConfigService
+	configPath, _ := config.ConfigPath()
+	secretsPath, _ := config.SecretsPath()
+	configService := app.ConfigService{
+		ConfigPath:  configPath,
+		SecretsPath: secretsPath,
+	}
 
 	// Build server options
 	serverOpts := []api.ServerOption{
 		api.WithEventsUsecase(eventsService),
+		api.WithStateUsecase(stateService),
+		api.WithConfigUsecase(configService),
 		api.WithHub(hub),
+		api.WithSSESecret([]byte(secrets.SSEHMACSecret.Value())),
+	}
+
+	// Add embedded web UI if available
+	if webFS, err := webembed.GetFS(); err == nil && webFS != nil {
+		serverOpts = append(serverOpts, api.WithWebFS(webFS))
+		log.Println("Web UI enabled")
 	}
 
 	// Enable Basic Auth for LAN mode (credentials are guaranteed by EnsureLanAuth)
