@@ -19,6 +19,7 @@ const (
 type VRClogSource struct {
 	replaySince     time.Time
 	logDir          string // optional override
+	waitForLogs     *bool  // optional override for wait behavior (nil = default)
 	logger          *slog.Logger
 	eventBufferSize int
 	errorBufferSize int
@@ -34,8 +35,23 @@ func WithLogDir(dir string) SourceOption {
 }
 
 // WithSourceLogger sets the logger for the source.
+// If logger is nil, it is ignored and the default logger is retained.
 func WithSourceLogger(logger *slog.Logger) SourceOption {
-	return func(s *VRClogSource) { s.logger = logger }
+	return func(s *VRClogSource) {
+		if logger != nil {
+			s.logger = logger
+		}
+	}
+}
+
+// WithWaitForLogsOption sets whether to wait for log files to appear.
+// If not set (nil), the default behavior is:
+//   - Wait when auto-detecting log directory (logDir is empty)
+//   - Don't wait when logDir is explicitly set (fail fast on misconfiguration)
+func WithWaitForLogsOption(wait bool) SourceOption {
+	return func(s *VRClogSource) {
+		s.waitForLogs = &wait
+	}
 }
 
 // WithEventBufferSize sets the event channel buffer size.
@@ -70,16 +86,41 @@ func NewVRClogSource(replaySince time.Time, opts ...SourceOption) *VRClogSource 
 	return s
 }
 
+// computeWaitForLogs determines whether to wait for log files to appear.
+// Default behavior: wait only when auto-detecting (logDir is empty).
+// When logDir is explicitly set, fail immediately to catch misconfigurations.
+// This can be overridden with WithWaitForLogsOption.
+func (s *VRClogSource) computeWaitForLogs() bool {
+	wait := s.logDir == ""
+	if s.waitForLogs != nil {
+		wait = *s.waitForLogs
+	}
+	return wait
+}
+
 // Start begins watching VRChat logs and returns event/error channels.
 // Both channels close when ctx is cancelled or on fatal error.
 func (s *VRClogSource) Start(ctx context.Context) (<-chan Event, <-chan error, error) {
+	// Defensive check: ensure logger is set
+	if s.logger == nil {
+		s.logger = slog.Default()
+	}
+
 	// Build vrclog options
+	waitForLogs := s.computeWaitForLogs()
 	var opts []vrclog.WatchOption
 	opts = append(opts, vrclog.WithReplaySinceTime(s.replaySince))
 	opts = append(opts, vrclog.WithIncludeRawLine(true))
+	opts = append(opts, vrclog.WithWaitForLogs(waitForLogs))
+	opts = append(opts, vrclog.WithLogger(s.logger))
 	if s.logDir != "" {
 		opts = append(opts, vrclog.WithLogDir(s.logDir))
 	}
+
+	s.logger.Info("starting VRChat log watcher",
+		"replay_since", s.replaySince,
+		"wait_for_logs", waitForLogs,
+	)
 
 	watcher, err := vrclog.NewWatcherWithOptions(opts...)
 	if err != nil {
