@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/graaaaa/vrclog-companion/internal/appinfo"
+	"github.com/vrclog/vrclog-companion/internal/appinfo"
 )
 
 // DataDir returns the application data directory path.

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
-import { apiClient, NowResponse, Event } from '../api/client'
+import { apiClient } from '../api/client'
+import type { Observation, StateSnapshot } from '../api/types'
 
 interface UseSSEOptions {
-  onEvent?: (event: Event) => void
-  onStateUpdate?: (state: NowResponse) => void
+  onObservation?: (observation: Observation) => void
+  onStateUpdate?: (state: StateSnapshot) => void
   enabled?: boolean
 }
 
@@ -17,8 +18,14 @@ const TOKEN_REFRESH_INTERVAL = 4 * 60 * 1000 // 4 minutes (token expires at 5)
 const MAX_BACKOFF = 30000 // 30 seconds
 const INITIAL_BACKOFF = 1000 // 1 second
 
+// useSSE subscribes to the generic /api/v1/stream "observation" event.
+// The server emits every Observation as a single event type — there is no
+// per-EventKind event name — so callers that need derived state should
+// prefer onStateUpdate (triggered on resync) and refetch /api/v1/state
+// after onObservation fires, rather than reimplementing projection logic
+// client-side.
 export function useSSE(options: UseSSEOptions): UseSSEResult {
-  const { onEvent, onStateUpdate, enabled = true } = options
+  const { onObservation, onStateUpdate, enabled = true } = options
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [reconnecting, setReconnecting] = useState(false)
@@ -58,7 +65,7 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
 
   const resync = useCallback(async () => {
     try {
-      const state = await apiClient.fetchNow()
+      const state = await apiClient.fetchState()
       onStateUpdate?.(state)
     } catch (err) {
       console.error('Failed to resync state:', err)
@@ -69,17 +76,16 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
     cleanup()
     setError(null)
 
-    // Fetch initial token
     const hasToken = await fetchAndSetToken()
     if (!hasToken) {
       setError('Failed to authenticate')
       return
     }
 
-    // Resync state before connecting
+    // Resync full projected state before connecting, so the UI is never
+    // stale between page load and the first live observation.
     await resync()
 
-    // Build SSE URL with token and optional last_event_id for reconnection
     const params = new URLSearchParams({ token: tokenRef.current! })
     if (lastEventIdRef.current) {
       params.set('last_event_id', lastEventIdRef.current)
@@ -94,40 +100,38 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
       setError(null)
       backoffRef.current = INITIAL_BACKOFF
 
-      // Schedule token refresh
       tokenRefreshTimerRef.current = window.setTimeout(async () => {
         const refreshed = await fetchAndSetToken()
         if (refreshed) {
-          // Reconnect with new token
           connect()
         }
       }, TOKEN_REFRESH_INTERVAL)
     }
 
-    // Handle incoming events and track lastEventId for reconnection
-    const handleEvent = (msg: MessageEvent) => {
-      // Save lastEventId for reconnection support
+    es.addEventListener('observation', (msg: MessageEvent) => {
       if (msg.lastEventId) {
         lastEventIdRef.current = msg.lastEventId
       }
       try {
-        const event = JSON.parse(msg.data) as Event
-        onEvent?.(event)
+        const observation = JSON.parse(msg.data) as Observation
+        onObservation?.(observation)
       } catch (err) {
-        console.error('Failed to parse SSE message:', err)
+        console.error('Failed to parse SSE observation:', err)
       }
-    }
+    })
 
-    // Register for specific event types (server sends event: <type>)
-    es.addEventListener('player_join', handleEvent)
-    es.addEventListener('player_left', handleEvent)
-    es.addEventListener('world_join', handleEvent)
+    // A reset event means the server could not resolve our Last-Event-ID
+    // (e.g. the database was reset). Drop our bookmark and do a full
+    // resync rather than looping on the same stale ID.
+    es.addEventListener('reset', () => {
+      lastEventIdRef.current = null
+      resync()
+    })
 
     es.onerror = () => {
       setConnected(false)
       cleanup()
 
-      // Schedule reconnect with exponential backoff
       setReconnecting(true)
       const delay = backoffRef.current
       backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF)
@@ -136,7 +140,7 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
         connect()
       }, delay)
     }
-  }, [cleanup, fetchAndSetToken, resync, onEvent])
+  }, [cleanup, fetchAndSetToken, resync, onObservation])
 
   useEffect(() => {
     if (enabled) {

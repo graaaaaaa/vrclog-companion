@@ -49,6 +49,16 @@ jobs:
       - name: Run integration tests
         run: go test -tags=integration -v ./test/integration/...
 
+      - name: Run E2E tests (media URL recovery)
+        run: go test -tags=e2e -v ./test/e2e/...
+
+      - name: Run linters
+        run: |
+          gofmt -l . | tee /tmp/gofmt.out
+          test ! -s /tmp/gofmt.out
+          go vet ./...
+          cd web && npm run lint
+
       - name: Security audit (npm)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
@@ -99,4 +109,4 @@ jobs:
           cp -R web/dist/* webembed/dist/
 
       - name: Build
-        run: go build -ldflags "-X github.com/graaaaa/vrclog-companion/internal/version.Version=${{ github.ref_name }}" -o vrclog.exe ./cmd/vrclog
+        run: go build -ldflags "-X github.com/vrclog/vrclog-companion/internal/version.Version=${{ github.ref_name }}" -o vrclog.exe ./cmd/vrclog-companion

@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/config"
+	"github.com/vrclog/vrclog-companion/internal/config"
 )
 
 // SendResult indicates the outcome of a send attempt.

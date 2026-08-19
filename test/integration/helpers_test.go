@@ -5,30 +5,34 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/api"
-	"github.com/graaaaa/vrclog-companion/internal/app"
-	"github.com/graaaaa/vrclog-companion/internal/event"
-	"github.com/graaaaa/vrclog-companion/internal/store"
+	vrclog "github.com/vrclog/vrclog-go"
+
+	"github.com/vrclog/vrclog-companion/internal/api"
+	"github.com/vrclog/vrclog-companion/internal/app"
+	"github.com/vrclog/vrclog-companion/internal/projector"
+	"github.com/vrclog/vrclog-companion/internal/sse"
+	"github.com/vrclog/vrclog-companion/internal/store"
 )
 
 // TestApp holds all dependencies for integration tests.
 type TestApp struct {
-	Server *httptest.Server
-	Store  *store.Store
-	Hub    *api.Hub
+	Server      *httptest.Server
+	Store       *store.Store
+	Broadcaster *sse.Broadcaster
+	Manager     *projector.Manager
 
-	// Cleanup function to release resources
 	cleanup func()
 }
 
 // NewTestApp creates a new test application with all dependencies wired up.
-// Call cleanup() when done to release resources.
+// Call Close() when done to release resources.
 func NewTestApp(t *testing.T, opts ...TestAppOption) *TestApp {
 	t.Helper()
 
@@ -42,7 +46,6 @@ func NewTestApp(t *testing.T, opts ...TestAppOption) *TestApp {
 		opt(cfg)
 	}
 
-	// Create temporary directory for test database
 	tmpDir, err := os.MkdirTemp("", "vrclog-integration-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -55,18 +58,21 @@ func NewTestApp(t *testing.T, opts ...TestAppOption) *TestApp {
 		t.Fatalf("failed to open store: %v", err)
 	}
 
-	// Create services
-	healthService := &app.HealthService{}
-	eventsService := &app.EventsService{Store: st}
-	hub := api.NewHub()
+	manager := projector.NewManager()
+	broadcaster := sse.NewBroadcaster()
 
-	// Start hub
-	go hub.Run()
+	healthService := app.HealthService{DB: st}
+	observationsService := &app.ObservationsService{Store: st}
+	stateService := app.StateService{Manager: manager}
+	mediaService := app.MediaService{Manager: manager}
+	statsService := app.NewStatsService(st, manager)
 
-	// Build server options
 	serverOpts := []api.ServerOption{
-		api.WithEventsUsecase(eventsService),
-		api.WithHub(hub),
+		api.WithObservationsUsecase(observationsService),
+		api.WithStateUsecase(stateService),
+		api.WithMediaUsecase(mediaService),
+		api.WithStatsUsecase(statsService),
+		api.WithBroadcaster(broadcaster, st),
 		api.WithSSESecret(cfg.sseSecret),
 	}
 
@@ -74,61 +80,93 @@ func NewTestApp(t *testing.T, opts ...TestAppOption) *TestApp {
 		serverOpts = append(serverOpts, api.WithBasicAuth(cfg.username, cfg.password))
 	}
 
-	// Create server (addr is ignored for httptest)
 	server := api.NewServer("127.0.0.1:0", healthService, serverOpts...)
+	server.SetReady(true)
 
-	// Create test server
 	ts := httptest.NewServer(server.Handler())
 
 	cleanup := func() {
 		ts.Close()
-		hub.Stop()
+		broadcaster.Stop()
 		st.Close()
 		os.RemoveAll(tmpDir)
 	}
 
 	return &TestApp{
-		Server:  ts,
-		Store:   st,
-		Hub:     hub,
-		cleanup: cleanup,
+		Server:      ts,
+		Store:       st,
+		Broadcaster: broadcaster,
+		Manager:     manager,
+		cleanup:     cleanup,
 	}
 }
 
 // Close releases all resources.
-func (app *TestApp) Close() {
-	if app.cleanup != nil {
-		app.cleanup()
+func (a *TestApp) Close() {
+	if a.cleanup != nil {
+		a.cleanup()
 	}
 }
 
 // URL returns the base URL of the test server.
-func (app *TestApp) URL() string {
-	return app.Server.URL
+func (a *TestApp) URL() string {
+	return a.Server.URL
 }
 
-// InsertTestEvent inserts a test event into the store.
-func (app *TestApp) InsertTestEvent(t *testing.T, eventType, playerName string) int64 {
+var testObsCounter int
+
+// InsertPlayerJoined commits a synthetic player.joined Observation and
+// applies it to the Projector Manager, returning its assigned sequence.
+func (a *TestApp) InsertPlayerJoined(t *testing.T, playerName string) int64 {
 	t.Helper()
+	return a.insertOne(t, vrclog.PlayerJoined{Player: vrclog.Player{ID: "usr_" + playerName, DisplayName: playerName}})
+}
+
+func (a *TestApp) insertOne(t *testing.T, ev vrclog.Event) int64 {
+	t.Helper()
+	testObsCounter++
 
 	now := time.Now().UTC()
-	ts := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	ev := &event.Event{
-		Type:       eventType,
-		Ts:         ts,
-		PlayerName: &playerName,
-		DedupeKey:  "test-key-" + playerName + "-" + eventType + "-" + now.String(),
-		IngestedAt: now,
+	sourceID := vrclog.SourceID("test-source")
+	record := vrclog.Record{
+		ID:         vrclog.RecordID(fmt.Sprintf("rec-%d", testObsCounter)),
+		Time:       now,
+		SourceID:   sourceID,
+		Path:       "/tmp/test.txt",
+		Offset:     int64(testObsCounter * 10),
+		NextOffset: int64((testObsCounter + 1) * 10),
+		Line:       uint64(testObsCounter),
+	}
+	obs := vrclog.Observation{
+		ID:        vrclog.ObservationID(fmt.Sprintf("obs-%d", testObsCounter)),
+		Time:      now,
+		AdapterID: "vrchat.core",
+		RuleID:    "test_rule",
+		Record: vrclog.RecordRef{
+			ID: record.ID, SourceID: record.SourceID, Offset: record.Offset, Line: record.Line,
+		},
+		Event: ev,
 	}
 
-	id, inserted, err := app.Store.InsertEvent(context.Background(), ev)
+	result, err := a.Store.CommitRecord(context.Background(), store.RecordCommit{
+		Record:     record,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obs}},
+		IngestedAt: now,
+	})
 	if err != nil {
-		t.Fatalf("failed to insert event: %v", err)
+		t.Fatalf("CommitRecord failed: %v", err)
 	}
-	if !inserted {
-		t.Fatalf("event was not inserted (duplicate?)")
+	if len(result.InsertedObservations) != 1 {
+		t.Fatalf("expected 1 inserted observation, got %d", len(result.InsertedObservations))
 	}
-	return id
+
+	stored := result.InsertedObservations[0]
+	if _, err := a.Manager.Apply(stored); err != nil {
+		t.Fatalf("Manager.Apply failed: %v", err)
+	}
+	a.Broadcaster.Broadcast(stored)
+
+	return stored.Sequence
 }
 
 // testAppConfig holds configuration for test app.

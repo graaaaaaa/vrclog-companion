@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/api/sseauth"
+	"github.com/vrclog/vrclog-companion/internal/api/sseauth"
 )
 
 // CORSConfig holds CORS middleware configuration.

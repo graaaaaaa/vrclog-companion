@@ -4,7 +4,7 @@
 package singleinstance
 
 import (
-	"github.com/graaaaa/vrclog-companion/internal/appinfo"
+	"github.com/vrclog/vrclog-companion/internal/appinfo"
 	"golang.org/x/sys/windows"
 )
 

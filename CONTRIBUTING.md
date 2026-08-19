@@ -12,7 +12,7 @@ Thank you for your interest in contributing to VRClog Companion!
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/graaaaa/vrclog-companion.git
+   git clone https://github.com/vrclog/vrclog-companion.git
    cd vrclog-companion
    ```
 
@@ -31,7 +31,7 @@ Thank you for your interest in contributing to VRClog Companion!
 4. Build the Web UI:
    ```bash
    cd web && npm run build && cd ..
-   cp -r web/dist/* webembed/dist/
+   mkdir -p webembed/dist && cp -r web/dist/* webembed/dist/
    ```
 
 5. Run tests:
@@ -45,7 +45,7 @@ Thank you for your interest in contributing to VRClog Companion!
 
 For backend development:
 ```bash
-go run ./cmd/vrclog
+go run ./cmd/vrclog-companion
 ```
 
 For frontend development (with hot reload):
@@ -121,12 +121,12 @@ go test -tags=integration ./test/integration/...
    ```
 4. Ensure Windows build works:
    ```bash
-   GOOS=windows GOARCH=amd64 go build ./cmd/vrclog
+   GOOS=windows GOARCH=amd64 go build ./cmd/vrclog-companion
    ```
 5. If you modified the Web UI, rebuild it:
    ```bash
    cd web && npm run build && cd ..
-   cp -r web/dist/* webembed/dist/
+   mkdir -p webembed/dist && cp -r web/dist/* webembed/dist/
    ```
 6. Push your branch and create a pull request
 7. Wait for CI to pass

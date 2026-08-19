@@ -16,7 +16,8 @@ const TimeFormat = "2006-01-02T15:04:05.000000000Z"
 
 // Store wraps a SQLite database connection.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 // Open opens a SQLite database with WAL mode and busy_timeout.
@@ -30,7 +31,13 @@ func Open(path string) (*Store, error) {
 	// - busy_timeout(5000): Wait 5s on lock contention
 	// - synchronous(NORMAL): Safe for WAL mode, better performance than FULL
 	// - foreign_keys(ON): Enforce referential integrity
-	dsn := fmt.Sprintf("file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)", escapedPath)
+	// - _txlock=immediate: BeginTx acquires the write lock immediately
+	//   (BEGIN IMMEDIATE), so CommitRecord's transaction cannot silently
+	//   upgrade from a read lock and lose atomicity under concurrent writers.
+	dsn := fmt.Sprintf(
+		"file:%s?mode=rwc&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_txlock=immediate",
+		escapedPath,
+	)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -47,12 +54,11 @@ func Open(path string) (*Store, error) {
 	// Using more than 1 connection allows read parallelism while writes are serialized
 	db.SetMaxOpenConns(4)
 
-	store := &Store{db: db}
+	store := &Store{db: db, path: path}
 
-	// Run migrations
-	if err := store.migrate(context.Background()); err != nil {
+	if err := store.initSchema(context.Background()); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, err
 	}
 
 	return store, nil

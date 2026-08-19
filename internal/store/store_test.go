@@ -2,552 +2,648 @@ package store
 
 import (
 	"context"
-	"encoding/base64"
+	"database/sql"
 	"errors"
-	"os"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/event"
+	vrclog "github.com/vrclog/vrclog-go"
+
+	"github.com/vrclog/vrclog-companion/internal/observation"
 )
-
-func TestOpen_CreatesDatabase(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.sqlite")
-
-	store, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer store.Close()
-
-	// Verify file exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		t.Error("database file was not created")
-	}
-
-	// Verify WAL mode
-	journalMode, err := store.journalMode()
-	if err != nil {
-		t.Fatalf("query journal_mode: %v", err)
-	}
-	if journalMode != "wal" {
-		t.Errorf("journal_mode = %q, want %q", journalMode, "wal")
-	}
-}
-
-func TestInsertEvent_Dedupe(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	evt := &event.Event{
-		Ts:         now,
-		Type:       event.TypePlayerJoin,
-		PlayerName: event.StringPtr("TestUser"),
-		DedupeKey:  "unique-key-123",
-		IngestedAt: now,
-	}
-
-	// First insert should succeed
-	id, inserted, err := store.InsertEvent(ctx, evt)
-	if err != nil {
-		t.Fatalf("first insert: %v", err)
-	}
-	if !inserted {
-		t.Error("first insert should return inserted=true")
-	}
-	if id == 0 {
-		t.Error("first insert should return a non-zero id")
-	}
-
-	// Second insert with same dedupe_key should be ignored
-	_, inserted, err = store.InsertEvent(ctx, evt)
-	if err != nil {
-		t.Fatalf("second insert: %v", err)
-	}
-	if inserted {
-		t.Error("duplicate insert should return inserted=false")
-	}
-
-	// Verify count is still 1
-	count, err := store.CountEvents(ctx)
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("count = %d, want 1", count)
-	}
-}
-
-func TestInsertEvent_DifferentKeys(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Insert multiple events with different keys
-	for i := 0; i < 5; i++ {
-		evt := &event.Event{
-			Ts:         now.Add(time.Duration(i) * time.Second),
-			Type:       event.TypePlayerJoin,
-			PlayerName: event.StringPtr("TestUser"),
-			DedupeKey:  "unique-key-" + string(rune('A'+i)),
-			IngestedAt: now,
-		}
-		_, inserted, err := store.InsertEvent(ctx, evt)
-		if err != nil {
-			t.Fatalf("insert %d: %v", i, err)
-		}
-		if !inserted {
-			t.Errorf("insert %d should succeed", i)
-		}
-	}
-
-	// Verify count is 5
-	count, err := store.CountEvents(ctx)
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 5 {
-		t.Errorf("count = %d, want 5", count)
-	}
-}
-
-func TestInsertEvent_Validation(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	tests := []struct {
-		name  string
-		event *event.Event
-	}{
-		{
-			name: "missing type",
-			event: &event.Event{
-				Ts:         now,
-				Type:       "",
-				DedupeKey:  "key-1",
-				IngestedAt: now,
-			},
-		},
-		{
-			name: "missing dedupe_key",
-			event: &event.Event{
-				Ts:         now,
-				Type:       event.TypePlayerJoin,
-				DedupeKey:  "",
-				IngestedAt: now,
-			},
-		},
-		{
-			name: "missing ts",
-			event: &event.Event{
-				Ts:         time.Time{},
-				Type:       event.TypePlayerJoin,
-				DedupeKey:  "key-2",
-				IngestedAt: now,
-			},
-		},
-		{
-			name: "missing ingested_at",
-			event: &event.Event{
-				Ts:         now,
-				Type:       event.TypePlayerJoin,
-				DedupeKey:  "key-3",
-				IngestedAt: time.Time{},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := store.InsertEvent(ctx, tt.event)
-			if !errors.Is(err, ErrInvalidEvent) {
-				t.Errorf("expected ErrInvalidEvent, got %v", err)
-			}
-		})
-	}
-}
-
-func TestGetLastEventTime_Empty(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-
-	lastTime, err := store.GetLastEventTime(ctx)
-	if err != nil {
-		t.Fatalf("GetLastEventTime: %v", err)
-	}
-	if !lastTime.IsZero() {
-		t.Errorf("expected zero time for empty database, got %v", lastTime)
-	}
-}
-
-func TestGetLastEventTime_ReturnsLatest(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Insert events at different times
-	events := []*event.Event{
-		{Ts: baseTime.Add(1 * time.Hour), Type: event.TypePlayerJoin, DedupeKey: "key-1", IngestedAt: time.Now().UTC()},
-		{Ts: baseTime.Add(3 * time.Hour), Type: event.TypePlayerJoin, DedupeKey: "key-2", IngestedAt: time.Now().UTC()}, // latest
-		{Ts: baseTime.Add(2 * time.Hour), Type: event.TypePlayerJoin, DedupeKey: "key-3", IngestedAt: time.Now().UTC()},
-	}
-
-	for _, e := range events {
-		if _, _, err := store.InsertEvent(ctx, e); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	lastTime, err := store.GetLastEventTime(ctx)
-	if err != nil {
-		t.Fatalf("GetLastEventTime: %v", err)
-	}
-
-	expected := baseTime.Add(3 * time.Hour)
-	if !lastTime.Equal(expected) {
-		t.Errorf("GetLastEventTime = %v, want %v", lastTime, expected)
-	}
-}
-
-func TestQueryEvents_Basic(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Insert test events
-	for i := 0; i < 10; i++ {
-		evt := &event.Event{
-			Ts:         baseTime.Add(time.Duration(i) * time.Minute),
-			Type:       event.TypePlayerJoin,
-			PlayerName: event.StringPtr("User" + string(rune('A'+i))),
-			DedupeKey:  "key-" + string(rune('A'+i)),
-			IngestedAt: time.Now().UTC(),
-		}
-		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Query all events
-	result, err := store.QueryEvents(ctx, QueryFilter{})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 10 {
-		t.Errorf("got %d items, want 10", len(result.Items))
-	}
-}
-
-func TestQueryEvents_WithLimit(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Insert 10 events
-	for i := 0; i < 10; i++ {
-		evt := &event.Event{
-			Ts:         baseTime.Add(time.Duration(i) * time.Minute),
-			Type:       event.TypePlayerJoin,
-			DedupeKey:  "key-" + string(rune('A'+i)),
-			IngestedAt: time.Now().UTC(),
-		}
-		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Query with limit
-	result, err := store.QueryEvents(ctx, QueryFilter{Limit: 5})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 5 {
-		t.Errorf("got %d items, want 5", len(result.Items))
-	}
-	if result.NextCursor == nil {
-		t.Error("expected NextCursor to be set")
-	}
-
-	// Query next page
-	result2, err := store.QueryEvents(ctx, QueryFilter{Limit: 5, Cursor: result.NextCursor})
-	if err != nil {
-		t.Fatalf("QueryEvents page 2: %v", err)
-	}
-	if len(result2.Items) != 5 {
-		t.Errorf("page 2 got %d items, want 5", len(result2.Items))
-	}
-	if result2.NextCursor != nil {
-		t.Error("expected NextCursor to be nil on last page")
-	}
-}
-
-func TestQueryEvents_DescendingOrder(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Insert 4 events at increasing times.
-	for i := 0; i < 4; i++ {
-		evt := &event.Event{
-			Ts:         baseTime.Add(time.Duration(i) * time.Minute),
-			Type:       event.TypePlayerJoin,
-			DedupeKey:  "key-" + string(rune('A'+i)),
-			IngestedAt: time.Now().UTC(),
-		}
-		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Page 1 should return newest-first.
-	result, err := store.QueryEvents(ctx, QueryFilter{Limit: 2})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 2 {
-		t.Fatalf("got %d items, want 2", len(result.Items))
-	}
-	if !result.Items[0].Ts.Equal(baseTime.Add(3 * time.Minute)) {
-		t.Errorf("item[0].Ts = %v, want %v", result.Items[0].Ts, baseTime.Add(3*time.Minute))
-	}
-	if !result.Items[1].Ts.Equal(baseTime.Add(2 * time.Minute)) {
-		t.Errorf("item[1].Ts = %v, want %v", result.Items[1].Ts, baseTime.Add(2*time.Minute))
-	}
-	if result.NextCursor == nil {
-		t.Fatal("expected NextCursor to be set")
-	}
-
-	// Page 2 should continue descending.
-	result2, err := store.QueryEvents(ctx, QueryFilter{Limit: 2, Cursor: result.NextCursor})
-	if err != nil {
-		t.Fatalf("QueryEvents page 2: %v", err)
-	}
-	if len(result2.Items) != 2 {
-		t.Fatalf("page 2 got %d items, want 2", len(result2.Items))
-	}
-	if !result2.Items[0].Ts.Equal(baseTime.Add(1 * time.Minute)) {
-		t.Errorf("page2 item[0].Ts = %v, want %v", result2.Items[0].Ts, baseTime.Add(1*time.Minute))
-	}
-	if !result2.Items[1].Ts.Equal(baseTime) {
-		t.Errorf("page2 item[1].Ts = %v, want %v", result2.Items[1].Ts, baseTime)
-	}
-	if result2.NextCursor != nil {
-		t.Error("expected NextCursor to be nil on last page")
-	}
-}
-
-func TestQueryEvents_AscendingOrder(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	// Insert 4 events at increasing times.
-	for i := 0; i < 4; i++ {
-		evt := &event.Event{
-			Ts:         baseTime.Add(time.Duration(i) * time.Minute),
-			Type:       event.TypePlayerJoin,
-			DedupeKey:  "key-" + string(rune('A'+i)),
-			IngestedAt: time.Now().UTC(),
-		}
-		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Page 1 should return oldest-first.
-	result, err := store.QueryEvents(ctx, QueryFilter{Limit: 2, Order: QueryOrderAsc})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 2 {
-		t.Fatalf("got %d items, want 2", len(result.Items))
-	}
-	if !result.Items[0].Ts.Equal(baseTime) {
-		t.Errorf("item[0].Ts = %v, want %v", result.Items[0].Ts, baseTime)
-	}
-	if !result.Items[1].Ts.Equal(baseTime.Add(1 * time.Minute)) {
-		t.Errorf("item[1].Ts = %v, want %v", result.Items[1].Ts, baseTime.Add(1*time.Minute))
-	}
-	if result.NextCursor == nil {
-		t.Fatal("expected NextCursor to be set")
-	}
-
-	// Page 2 should continue ascending.
-	result2, err := store.QueryEvents(ctx, QueryFilter{Limit: 2, Cursor: result.NextCursor, Order: QueryOrderAsc})
-	if err != nil {
-		t.Fatalf("QueryEvents page 2: %v", err)
-	}
-	if len(result2.Items) != 2 {
-		t.Fatalf("page 2 got %d items, want 2", len(result2.Items))
-	}
-	if !result2.Items[0].Ts.Equal(baseTime.Add(2 * time.Minute)) {
-		t.Errorf("page2 item[0].Ts = %v, want %v", result2.Items[0].Ts, baseTime.Add(2*time.Minute))
-	}
-	if !result2.Items[1].Ts.Equal(baseTime.Add(3 * time.Minute)) {
-		t.Errorf("page2 item[1].Ts = %v, want %v", result2.Items[1].Ts, baseTime.Add(3*time.Minute))
-	}
-	if result2.NextCursor != nil {
-		t.Error("expected NextCursor to be nil on last page")
-	}
-}
-
-func TestQueryEvents_LimitClamping(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Insert 5 events
-	for i := 0; i < 5; i++ {
-		evt := &event.Event{
-			Ts:         now.Add(time.Duration(i) * time.Second),
-			Type:       event.TypePlayerJoin,
-			DedupeKey:  "key-" + string(rune('A'+i)),
-			IngestedAt: now,
-		}
-		if _, _, err := store.InsertEvent(ctx, evt); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Test limit=0 defaults to 100 (but we only have 5)
-	result, err := store.QueryEvents(ctx, QueryFilter{Limit: 0})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 5 {
-		t.Errorf("got %d items, want 5", len(result.Items))
-	}
-
-	// Test limit > maxLimit is clamped (we can't easily test this with 5 events)
-}
-
-func TestQueryEvents_FilterByType(t *testing.T) {
-	store := openTestStore(t)
-	defer store.Close()
-
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	// Insert mixed events
-	events := []*event.Event{
-		{Ts: now, Type: event.TypePlayerJoin, DedupeKey: "key-1", IngestedAt: now},
-		{Ts: now, Type: event.TypePlayerLeft, DedupeKey: "key-2", IngestedAt: now},
-		{Ts: now, Type: event.TypePlayerJoin, DedupeKey: "key-3", IngestedAt: now},
-		{Ts: now, Type: event.TypeWorldJoin, DedupeKey: "key-4", IngestedAt: now},
-	}
-	for _, e := range events {
-		if _, _, err := store.InsertEvent(ctx, e); err != nil {
-			t.Fatalf("insert: %v", err)
-		}
-	}
-
-	// Query by type
-	joinType := event.TypePlayerJoin
-	result, err := store.QueryEvents(ctx, QueryFilter{Type: &joinType})
-	if err != nil {
-		t.Fatalf("QueryEvents: %v", err)
-	}
-	if len(result.Items) != 2 {
-		t.Errorf("got %d items, want 2", len(result.Items))
-	}
-}
-
-func TestDecodeCursor_Invalid(t *testing.T) {
-	tests := []struct {
-		name   string
-		cursor string
-	}{
-		{"empty", ""},
-		{"invalid base64", "not-valid-base64!!!"},
-		{"missing separator", base64.RawURLEncoding.EncodeToString([]byte("notimestamp"))},
-		{"invalid timestamp", base64.RawURLEncoding.EncodeToString([]byte("invalid|123"))},
-		{"invalid id", base64.RawURLEncoding.EncodeToString([]byte("2024-01-01T12:00:00.000000000Z|notanumber"))},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.cursor == "" {
-				return // empty string is handled by the caller
-			}
-			_, _, err := decodeCursor(tt.cursor)
-			if !errors.Is(err, ErrInvalidCursor) {
-				t.Errorf("expected ErrInvalidCursor, got %v", err)
-			}
-		})
-	}
-}
-
-func TestCursor_BackwardCompatibility(t *testing.T) {
-	// Test that StdEncoding cursors (old format) are still accepted
-	ts := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
-	id := int64(123)
-
-	// Create an old-style cursor with StdEncoding
-	oldCursor := base64.StdEncoding.EncodeToString(
-		[]byte(ts.Format(TimeFormat) + "|123"),
-	)
-
-	// Should be able to decode it
-	decodedTs, decodedID, err := decodeCursor(oldCursor)
-	if err != nil {
-		t.Fatalf("decodeCursor: %v", err)
-	}
-	if !decodedTs.Equal(ts) {
-		t.Errorf("timestamp = %v, want %v", decodedTs, ts)
-	}
-	if decodedID != id {
-		t.Errorf("id = %d, want %d", decodedID, id)
-	}
-}
-
-func TestCursor_RoundTrip(t *testing.T) {
-	ts := time.Date(2024, 6, 15, 10, 30, 45, 123456789, time.UTC)
-	id := int64(42)
-
-	cursor := encodeCursor(ts, id)
-	decodedTs, decodedID, err := decodeCursor(cursor)
-	if err != nil {
-		t.Fatalf("decodeCursor: %v", err)
-	}
-	if !decodedTs.Equal(ts) {
-		t.Errorf("timestamp = %v, want %v", decodedTs, ts)
-	}
-	if decodedID != id {
-		t.Errorf("id = %d, want %d", decodedID, id)
-	}
-}
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.sqlite")
-	store, err := Open(dbPath)
+	path := filepath.Join(t.TempDir(), "test.sqlite")
+	s, err := Open(path)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("open store: %v", err)
 	}
-	return store
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func makeRecord(sourceID string, offset int64, line uint64, at time.Time) vrclog.Record {
+	return vrclog.Record{
+		ID:         vrclog.RecordID(fmt.Sprintf("rec-%s-%d", sourceID, offset)),
+		Time:       at,
+		SourceID:   vrclog.SourceID(sourceID),
+		Path:       "/tmp/" + sourceID + ".txt",
+		Offset:     offset,
+		NextOffset: offset + 100,
+		Line:       line,
+	}
+}
+
+func makePlayerJoined(id string, record vrclog.Record, name string) vrclog.Observation {
+	return vrclog.Observation{
+		ID:        vrclog.ObservationID(id),
+		Time:      record.Time,
+		AdapterID: "vrchat.core",
+		RuleID:    "player_joined",
+		Record: vrclog.RecordRef{
+			ID: record.ID, SourceID: record.SourceID, Offset: record.Offset, Line: record.Line,
+		},
+		Event: vrclog.PlayerJoined{Player: vrclog.Player{ID: "usr_" + name, DisplayName: name}},
+	}
+}
+
+func makePlayerLeft(id string, record vrclog.Record, name string) vrclog.Observation {
+	return vrclog.Observation{
+		ID:        vrclog.ObservationID(id),
+		Time:      record.Time,
+		AdapterID: "vrchat.core",
+		RuleID:    "player_left",
+		Record: vrclog.RecordRef{
+			ID: record.ID, SourceID: record.SourceID, Offset: record.Offset, Line: record.Line,
+		},
+		Event: vrclog.PlayerLeft{Player: vrclog.Player{ID: "usr_" + name, DisplayName: name}},
+	}
+}
+
+// --- 23.1 Schema tests ---
+
+func TestSchema_EmptyDBCreatesVersion2(t *testing.T) {
+	s := openTestStore(t)
+	v, err := s.userVersion(context.Background())
+	if err != nil {
+		t.Fatalf("userVersion: %v", err)
+	}
+	if v != CurrentSchemaVersion {
+		t.Fatalf("user_version = %d, want %d", v, CurrentSchemaVersion)
+	}
+}
+
+func TestSchema_Version2Opens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.sqlite")
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	s1.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen existing v2 db: %v", err)
+	}
+	s2.Close()
+}
+
+func TestSchema_Version1Rejects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.sqlite")
+
+	raw, err := sql.Open("sqlite", "file:"+path+"?mode=rwc")
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := raw.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+	raw.Close()
+
+	_, err = Open(path)
+	if !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("Open() error = %v, want ErrUnsupportedSchema", err)
+	}
+}
+
+func TestSchema_Version0WithLegacyTablesRejects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.sqlite")
+
+	raw, err := sql.Open("sqlite", "file:"+path+"?mode=rwc")
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE events (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	raw.Close()
+
+	_, err = Open(path)
+	if !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("Open() error = %v, want ErrUnsupportedSchema", err)
+	}
+}
+
+func TestSchema_WALAndConstraintsEnabled(t *testing.T) {
+	s := openTestStore(t)
+	mode, err := s.journalMode()
+	if err != nil {
+		t.Fatalf("journalMode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", mode)
+	}
+}
+
+// --- 23.2 CommitRecord atomicity tests ---
+
+func TestCommitRecord_ObservationAndCursorCommit(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec, "Alice")
+
+	result, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obs}},
+		IngestedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CommitRecord: %v", err)
+	}
+	if len(result.InsertedObservations) != 1 {
+		t.Fatalf("InsertedObservations = %d, want 1", len(result.InsertedObservations))
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor == nil || cursor.Offset != rec.NextOffset {
+		t.Fatalf("cursor = %+v, want offset %d", cursor, rec.NextOffset)
+	}
+}
+
+func TestCommitRecord_ZeroObservationsStillCommitsCursor(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	result, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec,
+		Result:     vrclog.Result{},
+		IngestedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CommitRecord: %v", err)
+	}
+	if len(result.InsertedObservations) != 0 {
+		t.Fatalf("InsertedObservations = %d, want 0", len(result.InsertedObservations))
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor == nil || cursor.Offset != rec.NextOffset {
+		t.Fatalf("cursor = %+v, want offset %d", cursor, rec.NextOffset)
+	}
+}
+
+func TestCommitRecord_DiagnosticAndCursorCommit(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	diag := vrclog.Diagnostic{
+		Code:    vrclog.DiagnosticAdapterError,
+		Message: "boom",
+		Record:  vrclog.RecordRef{ID: rec.ID, SourceID: rec.SourceID, Offset: rec.Offset, Line: rec.Line},
+	}
+
+	_, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec,
+		Result:     vrclog.Result{Diagnostics: []vrclog.Diagnostic{diag}},
+		IngestedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CommitRecord: %v", err)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM diagnostics").Scan(&count); err != nil {
+		t.Fatalf("count diagnostics: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("diagnostics count = %d, want 1", count)
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor == nil || cursor.Offset != rec.NextOffset {
+		t.Fatalf("cursor not advanced: %+v", cursor)
+	}
+}
+
+func TestCommitRecord_DuplicateIdenticalObservationIgnoredCursorAdvances(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec1 := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec1, "Alice")
+
+	if _, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec1,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obs}},
+		IngestedAt: now,
+	}); err != nil {
+		t.Fatalf("first CommitRecord: %v", err)
+	}
+
+	// Replay: same observation content, later Record (simulates re-reading
+	// after a crash before the cursor advanced further).
+	rec2 := makeRecord("src1", rec1.NextOffset, 2, now)
+	obsReplay := makePlayerJoined("obs1", rec1, "Alice") // same ID, same fields
+
+	result, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec2,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obsReplay}},
+		IngestedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("replay CommitRecord: %v", err)
+	}
+	if len(result.InsertedObservations) != 0 {
+		t.Fatalf("InsertedObservations = %d, want 0 (duplicate)", len(result.InsertedObservations))
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor.Offset != rec2.NextOffset {
+		t.Fatalf("cursor.Offset = %d, want %d (cursor must still advance on duplicate)", cursor.Offset, rec2.NextOffset)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations").Scan(&count); err != nil {
+		t.Fatalf("count observations: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("observations count = %d, want 1 (no duplicate row)", count)
+	}
+}
+
+func TestCommitRecord_DuplicateConflictingObservationRollsBack(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec1 := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec1, "Alice")
+	if _, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec1,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obs}},
+		IngestedAt: now,
+	}); err != nil {
+		t.Fatalf("first CommitRecord: %v", err)
+	}
+
+	// Same Observation ID, different payload (different player name) -> conflict.
+	rec2 := makeRecord("src1", rec1.NextOffset, 2, now)
+	conflicting := makePlayerJoined("obs1", rec1, "Bob")
+	second := makePlayerJoined("obs2", rec2, "Carol")
+
+	_, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec2,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{second, conflicting}},
+		IngestedAt: now,
+	})
+	if !errors.Is(err, ErrObservationConflict) {
+		t.Fatalf("CommitRecord error = %v, want ErrObservationConflict", err)
+	}
+
+	// Whole transaction must have rolled back: "second" (obs2) must not
+	// exist, and the cursor must remain at rec1's position.
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM observations WHERE id = 'obs2'").Scan(&count); err != nil {
+		t.Fatalf("count obs2: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("obs2 should not exist after rollback, found %d", count)
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor.Offset != rec1.NextOffset {
+		t.Fatalf("cursor.Offset = %d, want %d (must not advance on rollback)", cursor.Offset, rec1.NextOffset)
+	}
+}
+
+func TestCommitRecord_InsertedListOrderAndContents(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	obs1 := makePlayerJoined("obs1", rec, "Alice")
+	obs2 := makePlayerJoined("obs2", rec, "Bob")
+	obs3 := makePlayerLeft("obs3", rec, "Alice")
+
+	result, err := s.CommitRecord(ctx, RecordCommit{
+		Record:     rec,
+		Result:     vrclog.Result{Observations: []vrclog.Observation{obs1, obs2, obs3}},
+		IngestedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CommitRecord: %v", err)
+	}
+	if len(result.InsertedObservations) != 3 {
+		t.Fatalf("InsertedObservations = %d, want 3", len(result.InsertedObservations))
+	}
+	wantIDs := []string{"obs1", "obs2", "obs3"}
+	for i, want := range wantIDs {
+		if string(result.InsertedObservations[i].ID) != want {
+			t.Fatalf("InsertedObservations[%d].ID = %s, want %s", i, result.InsertedObservations[i].ID, want)
+		}
+	}
+}
+
+// --- 23.3 Cursor tests ---
+
+func TestLatestCursor_ReturnsMostRecentlyUpdated(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec1 := makeRecord("src1", 0, 1, now)
+	if _, err := s.CommitRecord(ctx, RecordCommit{Record: rec1, IngestedAt: now}); err != nil {
+		t.Fatalf("commit src1: %v", err)
+	}
+
+	rec2 := makeRecord("src2", 0, 1, now.Add(time.Second))
+	if _, err := s.CommitRecord(ctx, RecordCommit{Record: rec2, IngestedAt: now.Add(time.Second)}); err != nil {
+		t.Fatalf("commit src2: %v", err)
+	}
+
+	cursor, err := s.LatestCursor(ctx)
+	if err != nil {
+		t.Fatalf("LatestCursor: %v", err)
+	}
+	if cursor.SourceID != "src2" {
+		t.Fatalf("LatestCursor.SourceID = %s, want src2", cursor.SourceID)
+	}
+}
+
+func TestCursor_RotationProducesMultipleSourceRows(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := s.CommitRecord(ctx, RecordCommit{Record: makeRecord("src1", 0, 1, now), IngestedAt: now}); err != nil {
+		t.Fatalf("commit src1: %v", err)
+	}
+	if _, err := s.CommitRecord(ctx, RecordCommit{Record: makeRecord("src2", 0, 1, now), IngestedAt: now}); err != nil {
+		t.Fatalf("commit src2: %v", err)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ingest_cursors").Scan(&count); err != nil {
+		t.Fatalf("count cursors: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("ingest_cursors rows = %d, want 2", count)
+	}
+}
+
+// --- 23.4 Query tests ---
+
+func TestListObservations_SequencePagination(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for i := 0; i < 5; i++ {
+		rec := makeRecord("src1", int64(i*10), uint64(i+1), now.Add(time.Duration(i)*time.Second))
+		obs := makePlayerJoined(fmt.Sprintf("obs%d", i), rec, fmt.Sprintf("Player%d", i))
+		if _, err := s.CommitRecord(ctx, RecordCommit{
+			Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+		}); err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+	}
+
+	page1, next1, err := s.ListObservations(ctx, ObservationQuery{Limit: 2, Order: OrderAsc})
+	if err != nil {
+		t.Fatalf("ListObservations page1: %v", err)
+	}
+	if len(page1) != 2 || next1 == nil {
+		t.Fatalf("page1 = %d items, next=%v, want 2 items with next cursor", len(page1), next1)
+	}
+	if string(page1[0].ID) != "obs0" || string(page1[1].ID) != "obs1" {
+		t.Fatalf("page1 IDs = %s, %s, want obs0, obs1", page1[0].ID, page1[1].ID)
+	}
+
+	page2, _, err := s.ListObservations(ctx, ObservationQuery{Limit: 2, Order: OrderAsc, AfterSequence: next1})
+	if err != nil {
+		t.Fatalf("ListObservations page2: %v", err)
+	}
+	if len(page2) != 2 || string(page2[0].ID) != "obs2" {
+		t.Fatalf("page2 = %+v, want [obs2, obs3]", page2)
+	}
+}
+
+func TestListObservations_TypeFilterArbitraryExact(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec, "Alice")
+	if _, err := s.CommitRecord(ctx, RecordCommit{
+		Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	unknownType := "some.unknown.kind"
+	items, _, err := s.ListObservations(ctx, ObservationQuery{Type: &unknownType})
+	if err != nil {
+		t.Fatalf("ListObservations unknown type: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("unknown type filter returned %d items, want 0 (no allowlist rejection)", len(items))
+	}
+
+	knownType := string(vrclog.EventKindPlayerJoined)
+	items, _, err = s.ListObservations(ctx, ObservationQuery{Type: &knownType})
+	if err != nil {
+		t.Fatalf("ListObservations known type: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("known type filter returned %d items, want 1", len(items))
+	}
+}
+
+func TestListObservations_AdapterFilter(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec, "Alice")
+	if _, err := s.CommitRecord(ctx, RecordCommit{
+		Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	other := "community.other"
+	items, _, err := s.ListObservations(ctx, ObservationQuery{AdapterID: &other})
+	if err != nil {
+		t.Fatalf("ListObservations: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("got %d items for unrelated adapter, want 0", len(items))
+	}
+
+	core := "vrchat.core"
+	items, _, err = s.ListObservations(ctx, ObservationQuery{AdapterID: &core})
+	if err != nil {
+		t.Fatalf("ListObservations: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d items for vrchat.core, want 1", len(items))
+	}
+}
+
+func TestListObservations_SinceUntil(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Truncate(time.Second)
+
+	for i := 0; i < 3; i++ {
+		rec := makeRecord("src1", int64(i*10), uint64(i+1), base.Add(time.Duration(i)*time.Hour))
+		obs := makePlayerJoined(fmt.Sprintf("obs%d", i), rec, fmt.Sprintf("P%d", i))
+		if _, err := s.CommitRecord(ctx, RecordCommit{
+			Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: base,
+		}); err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+	}
+
+	since := base.Add(30 * time.Minute)
+	until := base.Add(90 * time.Minute)
+	items, _, err := s.ListObservations(ctx, ObservationQuery{Since: &since, Until: &until, Order: OrderAsc})
+	if err != nil {
+		t.Fatalf("ListObservations: %v", err)
+	}
+	if len(items) != 1 || string(items[0].ID) != "obs1" {
+		t.Fatalf("since/until filter = %+v, want only obs1", items)
+	}
+}
+
+func TestListObservations_DeterministicOrder(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for i := 0; i < 3; i++ {
+		rec := makeRecord("src1", int64(i*10), uint64(i+1), now)
+		obs := makePlayerJoined(fmt.Sprintf("obs%d", i), rec, fmt.Sprintf("P%d", i))
+		if _, err := s.CommitRecord(ctx, RecordCommit{
+			Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+		}); err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+	}
+
+	desc, _, err := s.ListObservations(ctx, ObservationQuery{Order: OrderDesc})
+	if err != nil {
+		t.Fatalf("ListObservations desc: %v", err)
+	}
+	if len(desc) != 3 || string(desc[0].ID) != "obs2" || string(desc[2].ID) != "obs0" {
+		t.Fatalf("desc order = %+v, want obs2,obs1,obs0", desc)
+	}
+}
+
+func TestObservationByID(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	rec := makeRecord("src1", 0, 1, now)
+	obs := makePlayerJoined("obs1", rec, "Alice")
+	if _, err := s.CommitRecord(ctx, RecordCommit{
+		Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	found, err := s.ObservationByID(ctx, "obs1")
+	if err != nil {
+		t.Fatalf("ObservationByID: %v", err)
+	}
+	if found == nil {
+		t.Fatal("ObservationByID returned nil, want a match")
+	}
+
+	notFound, err := s.ObservationByID(ctx, "does-not-exist")
+	if err != nil {
+		t.Fatalf("ObservationByID: %v", err)
+	}
+	if notFound != nil {
+		t.Fatal("ObservationByID should return nil for unknown ID")
+	}
+}
+
+func TestObservationsAfterSequence_SSEBacklog(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	var seqs []int64
+	for i := 0; i < 4; i++ {
+		rec := makeRecord("src1", int64(i*10), uint64(i+1), now)
+		obs := makePlayerJoined(fmt.Sprintf("obs%d", i), rec, fmt.Sprintf("P%d", i))
+		result, err := s.CommitRecord(ctx, RecordCommit{
+			Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+		})
+		if err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+		seqs = append(seqs, result.InsertedObservations[0].Sequence)
+	}
+
+	backlog, err := s.ObservationsAfterSequence(ctx, seqs[1], 10)
+	if err != nil {
+		t.Fatalf("ObservationsAfterSequence: %v", err)
+	}
+	if len(backlog) != 2 || string(backlog[0].ID) != "obs2" || string(backlog[1].ID) != "obs3" {
+		t.Fatalf("backlog = %+v, want [obs2, obs3]", backlog)
+	}
+}
+
+func TestAllObservations_SequenceAscendingForRebuild(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for i := 0; i < 3; i++ {
+		rec := makeRecord("src1", int64(i*10), uint64(i+1), now)
+		obs := makePlayerJoined(fmt.Sprintf("obs%d", i), rec, fmt.Sprintf("P%d", i))
+		if _, err := s.CommitRecord(ctx, RecordCommit{
+			Record: rec, Result: vrclog.Result{Observations: []vrclog.Observation{obs}}, IngestedAt: now,
+		}); err != nil {
+			t.Fatalf("commit %d: %v", i, err)
+		}
+	}
+
+	var got []observation.StoredObservation
+	for obs, err := range s.AllObservations(ctx) {
+		if err != nil {
+			t.Fatalf("AllObservations: %v", err)
+		}
+		got = append(got, obs)
+	}
+	if len(got) != 3 {
+		t.Fatalf("AllObservations returned %d items, want 3", len(got))
+	}
+	for i, want := range []string{"obs0", "obs1", "obs2"} {
+		if string(got[i].ID) != want {
+			t.Fatalf("got[%d].ID = %s, want %s", i, got[i].ID, want)
+		}
+	}
 }

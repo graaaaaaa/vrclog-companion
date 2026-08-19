@@ -2,10 +2,11 @@ package notify
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/derive"
+	"github.com/vrclog/vrclog-companion/internal/projector"
 )
 
 // Discord embed color constants.
@@ -22,6 +23,16 @@ const MaxEmbedsPerRequest = 10
 type DiscordPayload struct {
 	Content string         `json:"content,omitempty"`
 	Embeds  []DiscordEmbed `json:"embeds,omitempty"`
+	// AllowedMentions is always sent with an empty Parse list, disabling
+	// every @mention/role/everyone ping regardless of what text ends up in
+	// an embed. This is the primary defense; sanitizeDiscordText below is
+	// defense-in-depth for clients that render mentions from plain text.
+	AllowedMentions DiscordAllowedMentions `json:"allowed_mentions"`
+}
+
+// DiscordAllowedMentions disables all mention parsing.
+type DiscordAllowedMentions struct {
+	Parse []string `json:"parse"`
 }
 
 // DiscordEmbed represents a Discord embed.
@@ -32,109 +43,101 @@ type DiscordEmbed struct {
 	Timestamp   string `json:"timestamp,omitempty"`
 }
 
-// BuildPayloads creates Discord payloads from batched derived events.
-// May return multiple payloads if events exceed MaxEmbedsPerRequest.
-func BuildPayloads(events []*derive.DerivedEvent) []DiscordPayload {
-	if len(events) == 0 {
+// BuildPayloads creates Discord payloads from batched Changes. Only
+// WorldChanged/PlayerJoined/PlayerLeft produce notifications — media URLs
+// are never sent to Discord (spec: no media notifications).
+func BuildPayloads(changes []projector.Change) []DiscordPayload {
+	if len(changes) == 0 {
 		return nil
 	}
 
-	// Group by type for cleaner messages
-	var joins, leaves []*derive.DerivedEvent
-	var worldChanges []*derive.DerivedEvent
+	var joins []projector.PlayerJoined
+	var leaves []projector.PlayerLeft
+	var worldChanges []projector.WorldChanged
 
-	for _, e := range events {
-		switch e.Type {
-		case derive.DerivedPlayerJoined:
-			joins = append(joins, e)
-		case derive.DerivedPlayerLeft:
-			leaves = append(leaves, e)
-		case derive.DerivedWorldChanged:
-			worldChanges = append(worldChanges, e)
+	for _, c := range changes {
+		switch v := c.(type) {
+		case projector.PlayerJoined:
+			joins = append(joins, v)
+		case projector.PlayerLeft:
+			leaves = append(leaves, v)
+		case projector.WorldChanged:
+			worldChanges = append(worldChanges, v)
 		}
 	}
 
 	var embeds []DiscordEmbed
-
-	// World change embeds (usually one, but handle multiples)
 	for _, wc := range worldChanges {
 		embeds = append(embeds, buildWorldEmbed(wc))
 	}
-
-	// Batch joins into single embed
 	if len(joins) > 0 {
 		embeds = append(embeds, buildJoinsEmbed(joins))
 	}
-
-	// Batch leaves into single embed
 	if len(leaves) > 0 {
 		embeds = append(embeds, buildLeavesEmbed(leaves))
 	}
 
-	// Split into multiple payloads if needed
 	return splitIntoPayloads(embeds)
 }
 
-func buildWorldEmbed(e *derive.DerivedEvent) DiscordEmbed {
-	worldName := deref(e.Event.WorldName)
-	if worldName == "" {
-		worldName = "Unknown World"
+func buildWorldEmbed(wc projector.WorldChanged) DiscordEmbed {
+	name := sanitizeDiscordText(wc.Current.Name)
+	if name == "" {
+		name = "Unknown World"
 	}
 
-	desc := fmt.Sprintf("Joined **%s**", worldName)
-
-	// Add instance info if available
-	if instanceID := deref(e.Event.InstanceID); instanceID != "" {
-		desc += fmt.Sprintf("\nInstance: `%s`", instanceID)
+	desc := fmt.Sprintf("Joined **%s**", name)
+	if wc.Current.InstanceID != "" {
+		desc += fmt.Sprintf("\nInstance: `%s`", sanitizeDiscordText(wc.Current.InstanceID))
 	}
 
 	return DiscordEmbed{
 		Title:       "World Changed",
 		Description: desc,
 		Color:       ColorBlue,
-		Timestamp:   e.Event.Ts.Format(time.RFC3339),
+		Timestamp:   wc.At.Format(time.RFC3339),
 	}
 }
 
-func buildJoinsEmbed(events []*derive.DerivedEvent) DiscordEmbed {
-	names := make([]string, len(events))
-	for i, e := range events {
-		names[i] = deref(e.Event.PlayerName)
+func buildJoinsEmbed(joins []projector.PlayerJoined) DiscordEmbed {
+	names := make([]string, len(joins))
+	for i, j := range joins {
+		names[i] = sanitizeDiscordText(j.Player.DisplayName)
 	}
 
 	var desc string
-	if len(events) == 1 {
+	if len(joins) == 1 {
 		desc = fmt.Sprintf("**%s** joined", names[0])
 	} else {
-		desc = fmt.Sprintf("**%d players** joined: %s", len(events), strings.Join(names, ", "))
+		desc = fmt.Sprintf("**%d players** joined: %s", len(joins), strings.Join(names, ", "))
 	}
 
 	return DiscordEmbed{
 		Title:       "Player Joined",
 		Description: desc,
 		Color:       ColorGreen,
-		Timestamp:   events[len(events)-1].Event.Ts.Format(time.RFC3339),
+		Timestamp:   joins[len(joins)-1].At.Format(time.RFC3339),
 	}
 }
 
-func buildLeavesEmbed(events []*derive.DerivedEvent) DiscordEmbed {
-	names := make([]string, len(events))
-	for i, e := range events {
-		names[i] = deref(e.Event.PlayerName)
+func buildLeavesEmbed(leaves []projector.PlayerLeft) DiscordEmbed {
+	names := make([]string, len(leaves))
+	for i, l := range leaves {
+		names[i] = sanitizeDiscordText(l.Player.DisplayName)
 	}
 
 	var desc string
-	if len(events) == 1 {
+	if len(leaves) == 1 {
 		desc = fmt.Sprintf("**%s** left", names[0])
 	} else {
-		desc = fmt.Sprintf("**%d players** left: %s", len(events), strings.Join(names, ", "))
+		desc = fmt.Sprintf("**%d players** left: %s", len(leaves), strings.Join(names, ", "))
 	}
 
 	return DiscordEmbed{
 		Title:       "Player Left",
 		Description: desc,
 		Color:       ColorRed,
-		Timestamp:   events[len(events)-1].Event.Ts.Format(time.RFC3339),
+		Timestamp:   leaves[len(leaves)-1].At.Format(time.RFC3339),
 	}
 }
 
@@ -149,14 +152,48 @@ func splitIntoPayloads(embeds []DiscordEmbed) []DiscordPayload {
 		if end > len(embeds) {
 			end = len(embeds)
 		}
-		payloads = append(payloads, DiscordPayload{Embeds: embeds[i:end]})
+		payloads = append(payloads, DiscordPayload{
+			Embeds:          embeds[i:end],
+			AllowedMentions: DiscordAllowedMentions{Parse: []string{}},
+		})
 	}
 	return payloads
 }
 
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
+var discordMarkdownEscaper = strings.NewReplacer(
+	"\\", "\\\\",
+	"*", "\\*",
+	"_", "\\_",
+	"~", "\\~",
+	"`", "\\`",
+	"|", "\\|",
+	">", "\\>",
+	"[", "\\[",
+	"]", "\\]",
+)
+
+// zeroWidthSpace breaks a character sequence Discord's client-side parser
+// looks for (a mention trigger, a URL scheme separator) while leaving the
+// text visually unchanged for a human reader.
+const zeroWidthSpace = "\u200b"
+
+var mentionNeutralizer = strings.NewReplacer(
+	"@everyone", "@"+zeroWidthSpace+"everyone",
+	"@here", "@"+zeroWidthSpace+"here",
+	"<@", "<"+zeroWidthSpace+"@",
+)
+
+var urlSchemePattern = regexp.MustCompile(`(https?):/{2}`)
+
+// sanitizeDiscordText prepares untrusted text (VRChat player/world names)
+// for inclusion in a Discord embed: Markdown control characters are
+// escaped, known mention trigger sequences (@everyone, @here, <@id>) are
+// broken with a zero-width space, and http(s):// URL text is broken the
+// same way so Discord cannot auto-link it. The AllowedMentions field on
+// the payload is the primary mention defense; this is defense-in-depth.
+func sanitizeDiscordText(s string) string {
+	s = discordMarkdownEscaper.Replace(s)
+	s = mentionNeutralizer.Replace(s)
+	s = urlSchemePattern.ReplaceAllString(s, "$1:"+zeroWidthSpace+"//")
+	return s
 }

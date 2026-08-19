@@ -42,7 +42,7 @@ jobs:
           GOOS: windows
           GOARCH: amd64
         run: |
-          go build -ldflags "-X github.com/graaaaa/vrclog-companion/internal/version.Version=${{ github.ref_name }}" -o vrclog.exe ./cmd/vrclog
+          go build -ldflags "-X github.com/vrclog/vrclog-companion/internal/version.Version=${{ github.ref_name }}" -o vrclog.exe ./cmd/vrclog-companion
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
