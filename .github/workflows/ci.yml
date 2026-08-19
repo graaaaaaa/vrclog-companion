@@ -53,6 +53,7 @@ jobs:
         run: go test -tags=e2e -v ./test/e2e/...
 
       - name: Run linters
+        shell: bash
         run: |
           gofmt -l . | tee /tmp/gofmt.out
           test ! -s /tmp/gofmt.out
