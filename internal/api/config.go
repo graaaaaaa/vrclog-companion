@@ -2,9 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
-	"github.com/graaaaa/vrclog-companion/internal/app"
+	"github.com/vrclog/vrclog-companion/internal/app"
 )
 
 // handleGetConfig handles GET /api/v1/config requests.
@@ -38,7 +39,14 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.cfg.UpdateConfig(r.Context(), req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), nil)
+		var verr *app.ValidationError
+		if errors.As(err, &verr) {
+			writeError(w, http.StatusBadRequest, verr.Message, nil)
+			return
+		}
+		// Anything else (config/secrets load or save failure) can carry a
+		// filesystem path in err.Error() — never return it to the client.
+		writeError(w, http.StatusInternalServerError, "failed to update configuration", err)
 		return
 	}
 

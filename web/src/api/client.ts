@@ -1,82 +1,38 @@
-// API client with Basic Auth support
+// API client with Basic Auth support.
 
-export interface WorldInfo {
-  WorldID: string
-  WorldName: string
-  InstanceID: string
-  JoinedAt: string
-}
+import type {
+  ObservationsResponse,
+  StateSnapshot,
+  MediaRecentResponse,
+  AdaptersResponse,
+  ConfigResponse,
+  ConfigUpdateRequest,
+  ConfigUpdateResponse,
+  TokenResponse,
+  StatsResponse,
+} from './types'
 
-export interface PlayerInfo {
-  PlayerName: string
-  PlayerID: string
-  JoinedAt: string
-}
-
-export interface NowResponse {
-  world: WorldInfo | null
-  players: PlayerInfo[]
-}
-
-export interface Event {
-  id: number
-  type: string
-  ts: string
-  world_id?: string
-  world_name?: string
-  instance_id?: string
-  player_name?: string
-  player_id?: string
-}
-
-export interface EventsResponse {
-  items: Event[]
-  next_cursor: string | null
-}
-
-export interface ConfigResponse {
-  port: number
-  lan_enabled: boolean
-  discord_batch_sec: number
-  notify_on_join: boolean
-  notify_on_leave: boolean
-  notify_on_world_join: boolean
-  discord_webhook_configured: boolean
-  log_path: string
-  basic_auth_username?: string
-  basic_auth_configured: boolean
-}
-
-export interface ConfigUpdateRequest {
-  port?: number
-  lan_enabled?: boolean
-  discord_batch_sec?: number
-  notify_on_join?: boolean
-  notify_on_leave?: boolean
-  notify_on_world_join?: boolean
-  discord_webhook_url?: string
-  log_path?: string
-  basic_auth_password?: string
-}
-
-export interface ConfigUpdateResponse {
-  success: boolean
-  restart_required: boolean
-  new_port?: number
-}
-
-export interface TokenResponse {
-  token: string
-  expires_in: number
-}
-
-export interface StatsResponse {
-  today_joins: number
-  today_leaves: number
-  today_world_changes: number
-  recent_players: string[]
-  last_event_at: string | null
-}
+export type {
+  Observation,
+  ObservationsResponse,
+  StateSnapshot,
+  CurrentWorld,
+  PlayerInfo,
+  LatestOpenableMedia,
+  MediaAttempt,
+  MediaResource,
+  MediaError,
+  MediaTarget,
+  MediaRecentResponse,
+  LoadedAdapter,
+  AdaptersResponse,
+  Health,
+  ConfigResponse,
+  ConfigUpdateRequest,
+  ConfigUpdateResponse,
+  TokenResponse,
+  StatsResponse,
+} from './types'
 
 class ApiClient {
   private credentials: { username: string; password: string } | null = null
@@ -97,8 +53,8 @@ class ApiClient {
     return { Authorization: `Basic ${encoded}` }
   }
 
-  async fetchNow(): Promise<NowResponse> {
-    const res = await fetch('/api/v1/now', {
+  async fetchState(): Promise<StateSnapshot> {
+    const res = await fetch('/api/v1/state', {
       headers: this.getAuthHeader(),
     })
     if (!res.ok) {
@@ -107,22 +63,45 @@ class ApiClient {
     return res.json()
   }
 
-  async fetchEvents(params?: {
+  async fetchObservations(params?: {
     type?: string
+    adapter_id?: string
     since?: string
     until?: string
     limit?: number
-    cursor?: string
-  }): Promise<EventsResponse> {
+    cursor?: number
+  }): Promise<ObservationsResponse> {
     const searchParams = new URLSearchParams()
     if (params?.type) searchParams.set('type', params.type)
+    if (params?.adapter_id) searchParams.set('adapter_id', params.adapter_id)
     if (params?.since) searchParams.set('since', params.since)
     if (params?.until) searchParams.set('until', params.until)
     if (params?.limit) searchParams.set('limit', params.limit.toString())
-    if (params?.cursor) searchParams.set('cursor', params.cursor)
+    if (params?.cursor !== undefined) searchParams.set('cursor', params.cursor.toString())
 
-    const url = `/api/v1/events${searchParams.toString() ? '?' + searchParams.toString() : ''}`
+    const url = `/api/v1/observations${searchParams.toString() ? '?' + searchParams.toString() : ''}`
     const res = await fetch(url, {
+      headers: this.getAuthHeader(),
+    })
+    if (!res.ok) {
+      throw new Error(`Failed to fetch: ${res.status}`)
+    }
+    return res.json()
+  }
+
+  async fetchMediaRecent(limit?: number): Promise<MediaRecentResponse> {
+    const url = `/api/v1/media/recent${limit ? `?limit=${limit}` : ''}`
+    const res = await fetch(url, {
+      headers: this.getAuthHeader(),
+    })
+    if (!res.ok) {
+      throw new Error(`Failed to fetch: ${res.status}`)
+    }
+    return res.json()
+  }
+
+  async fetchAdapters(): Promise<AdaptersResponse> {
+    const res = await fetch('/api/v1/adapters', {
       headers: this.getAuthHeader(),
     })
     if (!res.ok) {

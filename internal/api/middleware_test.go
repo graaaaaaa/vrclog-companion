@@ -79,6 +79,40 @@ func TestCSRFMiddleware_RejectsMissingOriginAndReferer(t *testing.T) {
 	}
 }
 
+// TestCSRFMiddleware_AllowsLANOriginMatchingRequestHost pins the fix for a
+// real LAN-mode bug: the server binds 0.0.0.0 so the configured
+// allowedHosts (built from the bind address) never matches a real
+// browser's Origin, which carries the actual LAN IP it connected to
+// (e.g. 192.168.1.50). Before the fix, every state-changing LAN request
+// (SSE token issuance, config updates) was rejected with 403.
+func TestCSRFMiddleware_AllowsLANOriginMatchingRequestHost(t *testing.T) {
+	mw := csrfMiddleware([]string{"0.0.0.0:8080"})
+
+	req := httptest.NewRequest(http.MethodPost, "/test", nil)
+	req.Host = "192.168.1.50:8080"
+	req.Header.Set("Origin", "http://192.168.1.50:8080")
+	rec := httptest.NewRecorder()
+
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for Origin matching request Host, got %d", rec.Code)
+	}
+}
+
+func TestCSRFMiddleware_RejectsOriginNotMatchingRequestHost(t *testing.T) {
+	mw := csrfMiddleware([]string{"0.0.0.0:8080"})
+
+	req := httptest.NewRequest(http.MethodPost, "/test", nil)
+	req.Host = "192.168.1.50:8080"
+	req.Header.Set("Origin", "http://evil.example.com")
+	rec := httptest.NewRecorder()
+
+	mw(okHandler).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for Origin not matching request Host, got %d", rec.Code)
+	}
+}
+
 func TestCSRFMiddleware_AllowsGETWithoutOrigin(t *testing.T) {
 	mw := csrfMiddleware([]string{"example.com"})
 

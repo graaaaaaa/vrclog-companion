@@ -43,15 +43,15 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		SchemaVersion:      CurrentSchemaVersion,
-		Port:               8080,
-		LanEnabled:         false,
-		LogPath:            "", // auto-detect
-		DiscordBatchSec:    3,
-		AutoStartEnabled:   false,
-		NotifyOnJoin:       true,
-		NotifyOnLeave:      true,
-		NotifyOnWorldJoin:  true,
+		SchemaVersion:     CurrentSchemaVersion,
+		Port:              8080,
+		LanEnabled:        false,
+		LogPath:           "", // auto-detect
+		DiscordBatchSec:   3,
+		AutoStartEnabled:  false,
+		NotifyOnJoin:      true,
+		NotifyOnLeave:     true,
+		NotifyOnWorldJoin: true,
 	}
 }
 

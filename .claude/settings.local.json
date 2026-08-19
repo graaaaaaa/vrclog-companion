@@ -25,7 +25,11 @@
       "Bash(cat:*)",
       "Bash(gh release:*)",
       "Bash(git tag:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(go list:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(go env:*)",
+      "Bash(gh api:*)"
     ]
   }
 }

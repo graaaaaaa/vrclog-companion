@@ -1,165 +1,161 @@
 import { useState, useEffect, useCallback } from 'react'
-import { apiClient, Event } from '../api/client'
+import { apiClient } from '../api/client'
+import type { Observation } from '../api/types'
 
-type EventType = 'player_join' | 'player_left' | 'world_join' | ''
+function typeBadgeClass(type: string): string {
+  if (type.startsWith('player.joined')) return 'bg-green-100 text-green-800'
+  if (type.startsWith('player.left')) return 'bg-red-100 text-red-800'
+  if (type.startsWith('world.')) return 'bg-blue-100 text-blue-800'
+  if (type.startsWith('resource.') || type.startsWith('media.')) return 'bg-purple-100 text-purple-800'
+  return 'bg-gray-100 text-gray-800'
+}
+
+function summarize(obs: Observation): string {
+  const p = obs.payload as Record<string, unknown>
+  switch (obs.type) {
+    case 'player.joined':
+    case 'player.left': {
+      const player = p.player as Record<string, unknown> | undefined
+      return (player?.display_name as string) || 'Unknown player'
+    }
+    case 'world.joining_observed':
+    case 'world.entering_observed': {
+      const world = p.world as Record<string, unknown> | undefined
+      return (world?.name as string) || (world?.id as string) || 'Unknown world'
+    }
+    default:
+      return obs.type
+  }
+}
+
+function ObservationRow({ obs }: { obs: Observation }) {
+  return (
+    <li className="p-3">
+      <div className="flex items-center gap-3">
+        <span className={`px-2 py-0.5 rounded text-xs font-medium ${typeBadgeClass(obs.type)}`}>
+          {obs.type}
+        </span>
+        <span className="text-xs text-gray-400">{obs.adapter_id}</span>
+        <span className="flex-1 text-gray-900 truncate">{summarize(obs)}</span>
+        <span className="text-xs text-gray-400 whitespace-nowrap">
+          {new Date(obs.occurred_at).toLocaleString()}
+        </span>
+      </div>
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs text-gray-500">payload</summary>
+        {/* Rendered as plain text via JSON.stringify — never
+            dangerouslySetInnerHTML — so an adversarial payload can only
+            ever appear as inert text. */}
+        <pre className="mt-1 p-2 bg-gray-50 rounded text-xs overflow-x-auto whitespace-pre-wrap break-all">
+          {JSON.stringify(obs.payload, null, 2)}
+        </pre>
+        <p className="mt-1 text-xs text-gray-400">
+          record: {obs.record.source_id} @offset {obs.record.offset} line {obs.record.line}
+        </p>
+      </details>
+    </li>
+  )
+}
+
+// maxRetainedObservations caps how many rows History keeps in memory across
+// repeated "Load more" clicks. Observations are newest-first, so capping
+// keeps the newest rows and drops the oldest tail rather than growing
+// unbounded (5000-10000+ rows visibly slows the browser).
+const maxRetainedObservations = 1000
 
 function History() {
-  const [events, setEvents] = useState<Event[]>([])
+  const [observations, setObservations] = useState<Observation[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [cursor, setCursor] = useState<string | null>(null)
+  const [cursor, setCursor] = useState<number | null>(null)
   const [hasMore, setHasMore] = useState(false)
-  const [filter, setFilter] = useState<EventType>('')
+  const [typeFilter, setTypeFilter] = useState('')
 
-  const fetchEvents = useCallback(
+  const fetchPage = useCallback(
     async (reset = false) => {
       setLoading(true)
       setError(null)
 
       try {
-        const res = await apiClient.fetchEvents({
-          type: filter || undefined,
-          cursor: reset ? undefined : cursor || undefined,
+        const res = await apiClient.fetchObservations({
+          type: typeFilter || undefined,
+          cursor: reset ? undefined : cursor ?? undefined,
           limit: 50,
         })
 
-        if (reset) {
-          setEvents(res.items)
-        } else {
-          setEvents((prev) => [...prev, ...res.items])
-        }
+        const merged = reset ? res.items : [...observations, ...res.items]
+        const capped = merged.length > maxRetainedObservations
+        setObservations(capped ? merged.slice(0, maxRetainedObservations) : merged)
         setCursor(res.next_cursor)
-        setHasMore(res.next_cursor !== null)
+        // Once the retention cap is hit, further pages would be fetched
+        // only to be immediately discarded by the slice above — hide
+        // "Load more" instead of leaving a button that silently no-ops.
+        setHasMore(res.next_cursor !== null && !capped)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unknown error')
       } finally {
         setLoading(false)
       }
     },
-    [filter, cursor]
+    [typeFilter, cursor, observations]
   )
 
   useEffect(() => {
-    // Reset and fetch when filter changes
     setCursor(null)
-    setEvents([])
-    fetchEvents(true)
-  }, [filter]) // eslint-disable-line react-hooks/exhaustive-deps
+    setObservations([])
+    fetchPage(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [typeFilter])
 
   const loadMore = () => {
     if (!loading && hasMore) {
-      fetchEvents()
+      fetchPage()
     }
   }
 
-  const getEventTypeLabel = (type: string) => {
-    switch (type) {
-      case 'player_join':
-        return 'Join'
-      case 'player_left':
-        return 'Left'
-      case 'world_join':
-        return 'World'
-      default:
-        return type
-    }
-  }
-
-  const getEventTypeColor = (type: string) => {
-    switch (type) {
-      case 'player_join':
-        return 'bg-green-100 text-green-800'
-      case 'player_left':
-        return 'bg-red-100 text-red-800'
-      case 'world_join':
-        return 'bg-blue-100 text-blue-800'
-      default:
-        return 'bg-gray-100 text-gray-800'
-    }
-  }
-
-  const getEventDescription = (event: Event) => {
-    switch (event.type) {
-      case 'player_join':
-      case 'player_left':
-        return event.player_name || 'Unknown player'
-      case 'world_join':
-        return event.world_name || 'Unknown world'
-      default:
-        return ''
-    }
-  }
+  const filters: { label: string; value: string }[] = [
+    { label: 'All', value: '' },
+    { label: 'Joins', value: 'player.joined' },
+    { label: 'Leaves', value: 'player.left' },
+    { label: 'World', value: 'world.joining_observed' },
+    { label: 'Media', value: 'resource.url_observed' },
+  ]
 
   return (
     <div className="space-y-4">
-      {/* Filter */}
-      <div className="flex gap-2">
-        <button
-          onClick={() => setFilter('')}
-          className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-            filter === '' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          All
-        </button>
-        <button
-          onClick={() => setFilter('player_join')}
-          className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-            filter === 'player_join' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          Joins
-        </button>
-        <button
-          onClick={() => setFilter('player_left')}
-          className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-            filter === 'player_left' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          Leaves
-        </button>
-        <button
-          onClick={() => setFilter('world_join')}
-          className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-            filter === 'world_join' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-          }`}
-        >
-          Worlds
-        </button>
+      <div className="flex gap-2 flex-wrap">
+        {filters.map((f) => (
+          <button
+            key={f.value}
+            onClick={() => setTypeFilter(f.value)}
+            className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              typeFilter === f.value
+                ? 'bg-blue-100 text-blue-700'
+                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
       </div>
 
-      {/* Error */}
       {error && (
         <div className="bg-red-50 border border-red-200 rounded-lg p-4">
           <p className="text-red-700">Error: {error}</p>
         </div>
       )}
 
-      {/* Events list */}
       <div className="bg-white rounded-lg shadow">
-        {events.length === 0 && !loading ? (
-          <div className="p-4 text-center text-gray-500">No events found</div>
+        {observations.length === 0 && !loading ? (
+          <div className="p-4 text-center text-gray-500">No observations found</div>
         ) : (
           <ul className="divide-y divide-gray-100">
-            {events.map((event) => (
-              <li key={event.id} className="p-3 flex items-center gap-3">
-                <span
-                  className={`px-2 py-0.5 rounded text-xs font-medium ${getEventTypeColor(
-                    event.type
-                  )}`}
-                >
-                  {getEventTypeLabel(event.type)}
-                </span>
-                <span className="flex-1 text-gray-900">{getEventDescription(event)}</span>
-                <span className="text-xs text-gray-400">
-                  {new Date(event.ts).toLocaleString()}
-                </span>
-              </li>
+            {observations.map((obs) => (
+              <ObservationRow key={obs.id} obs={obs} />
             ))}
           </ul>
         )}
 
-        {/* Load more */}
         {hasMore && (
           <div className="p-3 border-t border-gray-100">
             <button
@@ -173,8 +169,7 @@ function History() {
         )}
       </div>
 
-      {/* Loading indicator */}
-      {loading && events.length === 0 && (
+      {loading && observations.length === 0 && (
         <div className="flex items-center justify-center py-8">
           <div className="text-gray-500">Loading...</div>
         </div>

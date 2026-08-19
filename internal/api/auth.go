@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/api/sseauth"
+	"github.com/vrclog/vrclog-companion/internal/api/sseauth"
 )
 
 // tokenResponse is the response for POST /api/v1/auth/token.

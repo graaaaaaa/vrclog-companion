@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/graaaaa/vrclog-companion/internal/config"
+	"github.com/vrclog/vrclog-companion/internal/config"
 )
 
 // ConfigUsecase defines the configuration management use case.
@@ -58,6 +58,18 @@ type ConfigService struct {
 	SecretsPath string
 }
 
+// ValidationError marks a ConfigUpdate failure caused by bad client input
+// (out-of-range port, malformed webhook URL, ...) rather than an internal
+// I/O failure. Its Message is safe to return to the HTTP client verbatim;
+// unlike a wrapped load/save error, it never carries a filesystem path.
+// Callers should use errors.As to distinguish it from other UpdateConfig
+// errors, which must NOT be exposed to the client as-is.
+type ValidationError struct {
+	Message string
+}
+
+func (e *ValidationError) Error() string { return e.Message }
+
 // GetConfig returns the current configuration.
 func (s ConfigService) GetConfig(ctx context.Context) ConfigResponse {
 	cfg, _ := config.LoadConfigFrom(s.ConfigPath)
@@ -98,7 +110,7 @@ func (s ConfigService) UpdateConfig(ctx context.Context, req ConfigUpdateRequest
 	// Apply updates to config
 	if req.Port != nil {
 		if *req.Port < 1 || *req.Port > 65535 {
-			return ConfigUpdateResponse{}, fmt.Errorf("port must be between 1 and 65535")
+			return ConfigUpdateResponse{}, &ValidationError{Message: "port must be between 1 and 65535"}
 		}
 		cfg.Port = *req.Port
 		configChanged = true
@@ -109,7 +121,7 @@ func (s ConfigService) UpdateConfig(ctx context.Context, req ConfigUpdateRequest
 	}
 	if req.DiscordBatchSec != nil {
 		if *req.DiscordBatchSec < 0 {
-			return ConfigUpdateResponse{}, fmt.Errorf("discord_batch_sec must be non-negative")
+			return ConfigUpdateResponse{}, &ValidationError{Message: "discord_batch_sec must be non-negative"}
 		}
 		cfg.DiscordBatchSec = *req.DiscordBatchSec
 		configChanged = true
@@ -135,7 +147,7 @@ func (s ConfigService) UpdateConfig(ctx context.Context, req ConfigUpdateRequest
 	if req.DiscordWebhookURL != nil {
 		url := *req.DiscordWebhookURL
 		if url != "" && !isValidDiscordWebhookURL(url) {
-			return ConfigUpdateResponse{}, fmt.Errorf("invalid Discord webhook URL")
+			return ConfigUpdateResponse{}, &ValidationError{Message: "invalid Discord webhook URL"}
 		}
 		sec.DiscordWebhookURL = config.Secret(url)
 		secretsChanged = true

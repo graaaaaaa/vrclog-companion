@@ -1,47 +1,34 @@
-// Package ingest provides log event ingestion from vrclog-go to SQLite.
+// Package ingest drives the per-Record ingest pipeline: a RecordSource
+// yields vrclog.Record values, the Engine turns each into a Result, and
+// Runner persists that Result atomically via Store.CommitRecord before
+// notifying the rest of the app about newly inserted Observations.
 package ingest
 
 import (
 	"context"
-	"time"
+	"iter"
+
+	vrclog "github.com/vrclog/vrclog-go"
 )
 
-// EventSource abstracts event production for testing.
-// Implementations should close both channels when ctx is cancelled or on fatal error.
-type EventSource interface {
-	// Start begins producing events. Returns channels that close on ctx.Done().
-	// The error channel may receive multiple non-fatal errors during operation.
-	Start(ctx context.Context) (<-chan Event, <-chan error, error)
+// RecordSource yields a stream of Records from one log source.
+type RecordSource interface {
+	Records(ctx context.Context) iter.Seq2[vrclog.Record, error]
 }
 
-// Event represents a parsed VRChat log event.
-// This mirrors vrclog.Event fields needed for ingestion.
-type Event struct {
-	Type       string
-	Timestamp  time.Time
-	PlayerName string
-	PlayerID   string
-	WorldID    string
-	WorldName  string
-	InstanceID string
-	RawLine    string
+// RecordSourceFactory constructs a RecordSource resuming from cursor (nil
+// means start fresh). Runner calls this once at startup and again whenever
+// the current RecordSource ends with a fatal error, so a fresh, restartable
+// RecordSource is always available without the source implementation itself
+// needing restart logic.
+type RecordSourceFactory interface {
+	NewSource(ctx context.Context, cursor *vrclog.Cursor) (RecordSource, error)
 }
 
-// ParseError wraps a parse failure with the original line.
-type ParseError struct {
-	Line string
-	Err  error
-}
+// RecordSourceFactoryFunc adapts a plain function to RecordSourceFactory.
+type RecordSourceFactoryFunc func(ctx context.Context, cursor *vrclog.Cursor) (RecordSource, error)
 
-// Error implements the error interface.
-func (e *ParseError) Error() string {
-	if e.Err != nil {
-		return e.Err.Error()
-	}
-	return "parse error"
-}
-
-// Unwrap returns the underlying error.
-func (e *ParseError) Unwrap() error {
-	return e.Err
+// NewSource implements RecordSourceFactory.
+func (f RecordSourceFactoryFunc) NewSource(ctx context.Context, cursor *vrclog.Cursor) (RecordSource, error) {
+	return f(ctx, cursor)
 }

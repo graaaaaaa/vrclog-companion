@@ -1,9 +1,10 @@
-module github.com/graaaaa/vrclog-companion
+module github.com/vrclog/vrclog-companion
 
 go 1.25
 
 require (
-	github.com/vrclog/vrclog-go v0.0.0-20260114043748-10d90baa8f1b
+	github.com/vrclog/vrclog-adapters v0.0.0-20260819013211-7447dc6ccb99
+	github.com/vrclog/vrclog-go v0.0.0-20260819005214-b79aea8744de
 	golang.org/x/sys v0.39.0
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.42.2

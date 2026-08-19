@@ -3,143 +3,238 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/event"
-	"github.com/graaaaa/vrclog-companion/internal/store"
+	vrclog "github.com/vrclog/vrclog-go"
+
+	"github.com/vrclog/vrclog-companion/internal/observation"
 )
 
 const (
 	// heartbeatInterval is the interval for sending SSE heartbeat comments.
 	heartbeatInterval = 20 * time.Second
 
-	// missedEventsPageSize is the number of events to fetch per page during replay.
-	missedEventsPageSize = 100
+	// backlogPageSize bounds each DB page fetched while replaying backlog.
+	backlogPageSize = 100
 
-	// missedEventsMaxPages limits the number of pages to replay (best-effort).
-	missedEventsMaxPages = 5
+	// maxBacklogObservations bounds total replay work for a stale
+	// reconnect. A cursor older than this is reset rather than replayed,
+	// so one HTTP request can never be forced to redeliver an unbounded
+	// amount of history.
+	maxBacklogObservations = 1000
 )
 
-// handleStream handles GET /api/v1/stream (SSE)
+// SSEObservationStore is the store dependency needed to resolve
+// Last-Event-ID and replay backlog.
+type SSEObservationStore interface {
+	ObservationByID(ctx context.Context, id vrclog.ObservationID) (*observation.StoredObservation, error)
+	ObservationsAfterSequence(ctx context.Context, sequence int64, limit int) ([]observation.StoredObservation, error)
+	// LatestSequence returns the DB's current max sequence. This is the
+	// backlog upper bound — NOT Broadcaster.HighWaterSequence(), which
+	// starts at 0 on every process restart and only advances as new
+	// Observations are broadcast in the current process's lifetime. Using
+	// it as the bound would silently truncate backlog delivery to nothing
+	// immediately after a restart.
+	LatestSequence(ctx context.Context) (int64, error)
+}
+
+// handleStream handles GET /api/v1/stream (SSE).
+//
+// Race-free reconnect algorithm:
+//  1. Subscribe to the broadcaster first.
+//  2. Resolve Last-Event-ID to a sequence, then read the DB's current max
+//     sequence (LatestSequence) as the backlog upper bound.
+//  3. Replay DB backlog up to that bound, bounded by maxBacklogObservations.
+//  4. Only then start reading the live channel, skipping anything at or
+//     below what backlog actually delivered.
+//
+// Any Observation committed between steps 1 and 2 is guaranteed to be
+// covered by either the backlog query or the live channel — never both,
+// never neither: LatestSequence only ever sees committed rows (CommitRecord
+// commits before Broadcast fires), so either it already reflects the new
+// row (backlog delivers it) or it doesn't yet (the live channel — already
+// subscribed in step 1 — delivers it once Broadcast runs).
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	// Check for streaming support
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported", nil)
 		return
 	}
 
-	// Set SSE headers
+	ip := extractIP(r)
+	if !s.sseConnLimiter.acquire(ip) {
+		writeError(w, http.StatusServiceUnavailable, "too many active streams", nil)
+		return
+	}
+	defer s.sseConnLimiter.release(ip)
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	// Parse Last-Event-ID header or query parameter for reconnection support
-	// Query parameter allows manual reconnection with Last-Event-ID
+	sub := s.broadcaster.Subscribe()
+	defer s.broadcaster.Unsubscribe(sub)
+
 	lastEventID := r.Header.Get("Last-Event-ID")
 	if lastEventID == "" {
 		lastEventID = r.URL.Query().Get("last_event_id")
 	}
 
-	// If Last-Event-ID is provided, send missed events (best-effort)
+	var lastSent int64
 	if lastEventID != "" {
-		// Errors are ignored - invalid cursor or DB errors just skip replay
-		_ = s.sendMissedEvents(r.Context(), w, flusher, lastEventID)
+		start, ok := s.resolveLastEventID(r.Context(), w, flusher, lastEventID)
+		if !ok {
+			// Unknown/stale cursor: a reset event was already sent; the
+			// client is expected to refetch and reconnect without it.
+			return
+		}
+
+		highWater, err := s.observationsStore.LatestSequence(r.Context())
+		if err != nil {
+			return
+		}
+
+		delivered, ok := s.sendBacklog(r.Context(), w, flusher, start, highWater)
+		if !ok {
+			return
+		}
+		lastSent = delivered
 	}
 
-	// Subscribe to hub
-	sub := s.hub.Subscribe()
-	defer s.hub.Unsubscribe(sub)
-
-	// Send initial comment to establish connection
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	// Create heartbeat ticker
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
-	// Handle client disconnect
 	ctx := r.Context()
-
 	for {
 		select {
-		case e, ok := <-sub.Events():
+		case obs, ok := <-sub.Events():
 			if !ok {
-				// Channel closed, subscriber removed
 				return
 			}
-
-			writeSSEEvent(w, e)
+			if obs.Sequence <= lastSent {
+				continue // already delivered via backlog
+			}
+			writeSSEObservation(w, obs)
+			lastSent = obs.Sequence
 			flusher.Flush()
 
 		case <-ticker.C:
-			// Send heartbeat comment to keep connection alive
 			fmt.Fprintf(w, ":\n\n")
 			flusher.Flush()
 
 		case <-ctx.Done():
-			// Client disconnected
 			return
 
 		case <-sub.Done():
-			// Subscriber removed (hub stopped)
 			return
 		}
 	}
 }
 
-// sendMissedEvents sends events that were missed during a reconnection.
-// Uses Last-Event-ID as a cursor for QueryEvents.
-// Best-effort: invalid cursors or errors are silently ignored.
-// Limited to missedEventsMaxPages pages to prevent unbounded replay.
-func (s *Server) sendMissedEvents(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, lastEventID string) error {
-	cursor := lastEventID
-	filter := store.QueryFilter{
-		Cursor: &cursor,
-		Limit:  missedEventsPageSize,
-		Order:  store.QueryOrderAsc, // Fetch events after Last-Event-ID (forward in time)
+// resolveLastEventID looks up the sequence for a client-supplied
+// Last-Event-ID and returns ok=false if the caller should stop.
+//
+// A reset event is sent only when the ID is genuinely unknown/stale
+// (found == nil) — the client is expected to refetch full state rather
+// than silently lose data. A transient store error (e.g. a busy SQLite
+// read) is NOT treated the same way: sending a reset would discard a
+// still-valid cursor over a temporary hiccup, so the connection is
+// closed without a reset and the client's next reconnect retries with
+// the same Last-Event-ID.
+func (s *Server) resolveLastEventID(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, lastEventID string) (sequence int64, ok bool) {
+	found, err := s.observationsStore.ObservationByID(ctx, vrclog.ObservationID(lastEventID))
+	if err != nil {
+		return 0, false
 	}
-
-	for page := 0; page < missedEventsMaxPages; page++ {
-		result, err := s.events.Query(ctx, filter)
-		if err != nil {
-			if errors.Is(err, store.ErrInvalidCursor) {
-				// Invalid cursor - skip replay and start fresh
-				return nil
-			}
-			// Other errors (DB, context cancelled) - stop replay
-			return err
-		}
-
-		for i := range result.Items {
-			writeSSEEvent(w, &result.Items[i])
-		}
-		flusher.Flush()
-
-		if result.NextCursor == nil {
-			break
-		}
-		filter.Cursor = result.NextCursor
+	if found == nil {
+		writeSSEReset(w, flusher)
+		return 0, false
 	}
-
-	return nil
+	return found.Sequence, true
 }
 
-// writeSSEEvent writes a single event in SSE format.
-// Uses cursor-style ID (base64(ts|id)) for Last-Event-ID support.
-func writeSSEEvent(w http.ResponseWriter, e *event.Event) {
-	data, err := json.Marshal(e)
+// sendBacklog replays DB Observations in (from, highWater], returning the
+// sequence actually delivered (so the caller's live-channel dedup starts
+// from the right place) and whether the connection should continue.
+//
+// Delivery is buffered in `pending` and only written to the wire once we
+// know the batch is within maxBacklogObservations — a stale reconnect that
+// would require an unbounded replay gets a clean event: reset instead of a
+// half-delivered backlog followed by an abrupt cutoff.
+func (s *Server) sendBacklog(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, from, highWater int64) (delivered int64, ok bool) {
+	if from >= highWater {
+		return from, true
+	}
+
+	cursor := from
+	replayed := 0
+	pending := make([]observation.StoredObservation, 0, backlogPageSize)
+
+	flushPending := func() {
+		for _, obs := range pending {
+			writeSSEObservation(w, obs)
+		}
+		if len(pending) > 0 {
+			flusher.Flush()
+		}
+	}
+
+	for {
+		batch, err := s.observationsStore.ObservationsAfterSequence(ctx, cursor, backlogPageSize)
+		if err != nil {
+			return from, false
+		}
+		if len(batch) == 0 {
+			break
+		}
+
+		for _, obs := range batch {
+			if obs.Sequence > highWater {
+				flushPending()
+				return cursor, true // rest is covered by the live channel
+			}
+
+			replayed++
+			if replayed > maxBacklogObservations {
+				writeSSEReset(w, flusher)
+				return from, false
+			}
+
+			pending = append(pending, obs)
+			cursor = obs.Sequence
+		}
+
+		if len(batch) < backlogPageSize {
+			break
+		}
+	}
+
+	flushPending()
+	return cursor, true
+}
+
+func writeSSEObservation(w http.ResponseWriter, obs observation.StoredObservation) {
+	data, err := json.Marshal(toObservationDTO(obs))
 	if err != nil {
 		return
 	}
-
-	eventID := store.EncodeCursor(e.Ts, e.ID)
-	fmt.Fprintf(w, "id: %s\n", eventID)
-	fmt.Fprintf(w, "event: %s\n", e.Type)
+	fmt.Fprintf(w, "id: %s\n", obs.ID)
+	fmt.Fprintf(w, "event: observation\n")
 	fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+// writeSSEReset tells the client its Last-Event-ID is unknown (e.g. the
+// database was reset). The empty id clears the browser's EventSource
+// bookmark so a naive client cannot loop by resending the same stale ID.
+func writeSSEReset(w http.ResponseWriter, flusher http.Flusher) {
+	fmt.Fprintf(w, "id: \n")
+	fmt.Fprintf(w, "event: reset\n")
+	fmt.Fprintf(w, "data: {}\n\n")
+	flusher.Flush()
 }
