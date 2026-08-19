@@ -1,10 +1,12 @@
-module github.com/graaaaa/vrclog-companion
+module github.com/vrclog/vrclog-companion
 
 go 1.25
 
 require (
-	github.com/vrclog/vrclog-go v0.0.0-20251228023237-94f515292235
+	github.com/vrclog/vrclog-adapters v0.0.0-20260819013211-7447dc6ccb99
+	github.com/vrclog/vrclog-go v0.0.0-20260819005214-b79aea8744de
 	golang.org/x/sys v0.39.0
+	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.42.2
 )
 
@@ -17,7 +19,6 @@ require (
 	github.com/nxadm/tail v1.4.11 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
-	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	modernc.org/libc v1.66.10 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

@@ -1,7 +1,14 @@
-// Package app provides application use cases.
+// Package app provides application use cases: thin interfaces the api
+// package depends on, implemented by services that wire concrete store/
+// projector/ingest state together.
 package app
 
-import "context"
+import (
+	"context"
+	"time"
+
+	"github.com/vrclog/vrclog-companion/internal/ingest"
+)
 
 // HealthUsecase defines the health check use case.
 type HealthUsecase interface {
@@ -10,71 +17,62 @@ type HealthUsecase interface {
 
 // HealthChecker defines the interface for checking component health.
 type HealthChecker interface {
-	// Ping checks if the component is healthy.
-	// Returns nil if healthy, error otherwise.
 	Ping(ctx context.Context) error
 }
 
-// HealthResult represents the health check response.
-type HealthResult struct {
-	Status     string                     `json:"status"`
-	Version    string                     `json:"version"`
-	Components map[string]ComponentHealth `json:"components,omitempty"`
+// IngestStatusProvider reports current ingest health.
+type IngestStatusProvider interface {
+	Status() ingest.Status
 }
 
-// ComponentHealth represents the health status of a single component.
-type ComponentHealth struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+// HealthResult represents the health check response. It deliberately
+// carries no paths, URLs, or secrets — /api/v1/health is unauthenticated.
+type HealthResult struct {
+	Status          string `json:"status"`
+	Database        string `json:"database"`
+	Ingest          string `json:"ingest"`
+	LastIngestError string `json:"last_ingest_error"`
+	LastRecordAt    string `json:"last_record_at"`
+	LoadedAdapters  int    `json:"loaded_adapters"`
 }
 
 // Health status constants.
 const (
-	StatusHealthy   = "healthy"
-	StatusDegraded  = "degraded"
-	StatusUnhealthy = "unhealthy"
+	StatusOK       = "ok"
+	StatusDegraded = "degraded"
 )
 
 // HealthService implements HealthUsecase.
 type HealthService struct {
-	Version           string
-	DB                HealthChecker
-	DiscordConfigured bool
+	DB             HealthChecker
+	Ingest         IngestStatusProvider
+	LoadedAdapters int
 }
 
 // Handle returns the current health status.
-// Checks all registered components and returns overall status.
 func (s HealthService) Handle(ctx context.Context) (HealthResult, error) {
 	result := HealthResult{
-		Status:     StatusHealthy,
-		Version:    s.Version,
-		Components: make(map[string]ComponentHealth),
+		Status:         StatusOK,
+		Database:       StatusOK,
+		LoadedAdapters: s.LoadedAdapters,
 	}
 
-	// Check database if configured
 	if s.DB != nil {
 		if err := s.DB.Ping(ctx); err != nil {
-			result.Components["database"] = ComponentHealth{
-				Status:  StatusUnhealthy,
-				Message: "database connection failed",
-			}
+			result.Database = "error"
 			result.Status = StatusDegraded
-		} else {
-			result.Components["database"] = ComponentHealth{
-				Status: StatusHealthy,
-			}
 		}
 	}
 
-	// Report Discord webhook configuration status
-	if s.DiscordConfigured {
-		result.Components["discord_webhook"] = ComponentHealth{
-			Status: StatusHealthy,
+	if s.Ingest != nil {
+		st := s.Ingest.Status()
+		result.Ingest = string(st.State)
+		result.LastIngestError = st.LastError
+		if !st.LastRecordAt.IsZero() {
+			result.LastRecordAt = st.LastRecordAt.UTC().Format(time.RFC3339)
 		}
-	} else {
-		result.Components["discord_webhook"] = ComponentHealth{
-			Status:  "unconfigured",
-			Message: "Discord webhook not configured",
+		if st.State != ingest.StateRunning {
+			result.Status = StatusDegraded
 		}
 	}
 

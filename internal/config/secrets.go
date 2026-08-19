@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	passwordLength   = 24
-	passwordCharset  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-	defaultUsername  = "admin"
-	sseSecretLength  = 32 // 256 bits for HMAC-SHA256
+	passwordLength  = 24
+	passwordCharset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	defaultUsername = "admin"
+	sseSecretLength = 32 // 256 bits for HMAC-SHA256
 )
 
 // SecretsLoadStatus indicates how secrets were loaded.

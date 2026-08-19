@@ -1,0 +1,4 @@
+2026.08.18 12:00:00 Log        -  [YamaStream] Resolve youtube url: https://www.youtube.com/watch?v=TESTVIDEO01
+2026.08.18 12:00:01 Debug      -  [Video Playback] Attempting to resolve URL 'https://relay.example.invalid/TESTVIDEO01'
+2026.08.18 12:00:02 Debug      -  [Video Playback] URL 'https://relay.example.invalid/TESTVIDEO01' resolved to 'https://cdn.example.invalid/TESTVIDEO01.mp4'
+2026.08.18 12:00:03 Log        -  [YamaStream] [1] Video error: 500.

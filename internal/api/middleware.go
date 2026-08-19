@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/api/sseauth"
+	"github.com/vrclog/vrclog-companion/internal/api/sseauth"
 )
 
 // CORSConfig holds CORS middleware configuration.
@@ -71,11 +71,21 @@ func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
 				return
 			}
 
+			// r.Host is whichever host:port the client actually used to
+			// reach this server. In LAN mode the server binds 0.0.0.0, so
+			// the configured allowedHosts (built from the bind address)
+			// never matches a real browser's Origin/Referer host — only
+			// r.Host reflects the LAN IP the browser actually connected
+			// to. Checking against it is the standard same-origin check
+			// and is what makes LAN-mode POST/PUT requests (e.g. SSE
+			// token issuance, config updates) actually work.
+			requestHosts := append([]string{r.Host}, allowedHosts...)
+
 			// Check Origin header first
 			origin := r.Header.Get("Origin")
 			if origin != "" {
 				originURL, err := url.Parse(origin)
-				if err != nil || !isAllowedHost(originURL.Host, allowedHosts) {
+				if err != nil || !isAllowedHost(originURL.Host, requestHosts) {
 					writeError(w, http.StatusForbidden, "Forbidden: invalid origin", nil)
 					return
 				}
@@ -87,7 +97,7 @@ func csrfMiddleware(allowedHosts []string) func(http.Handler) http.Handler {
 			referer := r.Header.Get("Referer")
 			if referer != "" {
 				refererURL, err := url.Parse(referer)
-				if err != nil || !isAllowedHost(refererURL.Host, allowedHosts) {
+				if err != nil || !isAllowedHost(refererURL.Host, requestHosts) {
 					writeError(w, http.StatusForbidden, "Forbidden: invalid referer", nil)
 					return
 				}

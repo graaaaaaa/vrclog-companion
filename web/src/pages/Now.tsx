@@ -1,73 +1,52 @@
-import { useState, useEffect, useCallback } from 'react'
-import { apiClient, NowResponse, Event, PlayerInfo } from '../api/client'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { apiClient } from '../api/client'
+import type { StateSnapshot } from '../api/types'
 import { useSSE } from '../hooks/useSSE'
+import { SafeLink } from '../components/SafeLink'
+import { CopyButton } from '../components/CopyButton'
+
+function statusLabel(status: 'observed' | 'failed'): string {
+  return status === 'failed' ? '再生失敗' : 'URL検出'
+}
+
+function statusBadgeClass(status: 'observed' | 'failed'): string {
+  return status === 'failed' ? 'bg-red-100 text-red-800' : 'bg-blue-100 text-blue-800'
+}
 
 function Now() {
-  const [state, setState] = useState<NowResponse | null>(null)
+  const [state, setState] = useState<StateSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const handleEvent = useCallback((event: Event) => {
-    setState((prev) => {
-      if (!prev) return prev
-
-      switch (event.type) {
-        case 'world_join':
-          return {
-            world: {
-              WorldID: event.world_id || '',
-              WorldName: event.world_name || '',
-              InstanceID: event.instance_id || '',
-              JoinedAt: event.ts,
-            },
-            players: [],
-          }
-        case 'player_join':
-          const newPlayer: PlayerInfo = {
-            PlayerName: event.player_name || '',
-            PlayerID: event.player_id || '',
-            JoinedAt: event.ts,
-          }
-          // Dedupe by PlayerID
-          const existingIndex = prev.players.findIndex(
-            (p) => (p.PlayerID && p.PlayerID === newPlayer.PlayerID) ||
-                   (!p.PlayerID && p.PlayerName === newPlayer.PlayerName)
-          )
-          if (existingIndex >= 0) {
-            return prev
-          }
-          return { ...prev, players: [...prev.players, newPlayer] }
-        case 'player_left':
-          return {
-            ...prev,
-            players: prev.players.filter(
-              (p) => !(
-                (event.player_id && p.PlayerID === event.player_id) ||
-                (!event.player_id && p.PlayerName === event.player_name)
-              )
-            ),
-          }
-        default:
-          return prev
-      }
-    })
+  // Refetching /api/v1/state on every observation avoids reimplementing
+  // Projector logic client-side; the server is the single source of truth
+  // for derived state.
+  const refetchTimer = useRef<number | null>(null)
+  const handleObservation = useCallback(() => {
+    if (refetchTimer.current !== null) return
+    refetchTimer.current = window.setTimeout(() => {
+      refetchTimer.current = null
+      apiClient
+        .fetchState()
+        .then(setState)
+        .catch((err) => console.error('Failed to refetch state:', err))
+    }, 150)
   }, [])
 
-  const handleStateUpdate = useCallback((newState: NowResponse) => {
+  const handleStateUpdate = useCallback((newState: StateSnapshot) => {
     setState(newState)
     setLoading(false)
     setError(null)
   }, [])
 
   const { connected, error: sseError, reconnecting } = useSSE({
-    onEvent: handleEvent,
+    onObservation: handleObservation,
     onStateUpdate: handleStateUpdate,
   })
 
   useEffect(() => {
-    // Initial fetch
     apiClient
-      .fetchNow()
+      .fetchState()
       .then((data) => {
         setState(data)
         setLoading(false)
@@ -94,9 +73,10 @@ function Now() {
     )
   }
 
+  const media = state?.latest_openable_media
+
   return (
     <div className="space-y-6">
-      {/* Connection status */}
       <div className="flex items-center gap-2 text-sm">
         <span
           className={`w-2 h-2 rounded-full ${
@@ -109,17 +89,14 @@ function Now() {
         {sseError && <span className="text-red-500">({sseError})</span>}
       </div>
 
-      {/* Current World */}
       <div className="bg-white rounded-lg shadow p-4">
         <h2 className="text-lg font-semibold text-gray-800 mb-3">Current World</h2>
         {state?.world ? (
           <div className="space-y-1">
-            <p className="text-gray-900 font-medium">{state.world.WorldName || 'Unknown'}</p>
-            <p className="text-sm text-gray-500">
-              Instance: {state.world.InstanceID || 'Unknown'}
-            </p>
+            <p className="text-gray-900 font-medium">{state.world.name || 'Unknown'}</p>
+            <p className="text-sm text-gray-500">Instance: {state.world.instance_id || 'Unknown'}</p>
             <p className="text-xs text-gray-400">
-              Joined: {new Date(state.world.JoinedAt).toLocaleString()}
+              Joined: {new Date(state.world.joined_at).toLocaleString()}
             </p>
           </div>
         ) : (
@@ -127,7 +104,33 @@ function Now() {
         )}
       </div>
 
-      {/* Players */}
+      {media && (
+        <div className="bg-white rounded-lg shadow p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold text-gray-800">Latest Media</h2>
+            <span className={`px-2 py-0.5 rounded text-xs font-medium ${statusBadgeClass(media.status)}`}>
+              {statusLabel(media.status)}
+            </span>
+          </div>
+          <SafeLink url={media.url} className="text-sm text-blue-600 hover:underline break-all block mb-3" />
+          <div className="flex gap-2">
+            <CopyButton text={media.url} />
+            <SafeLink
+              url={media.url}
+              className="px-3 py-1.5 text-sm rounded-md bg-blue-50 text-blue-700 hover:bg-blue-100 transition-colors"
+            >
+              ブラウザで開く
+            </SafeLink>
+            <a
+              href="#/media"
+              className="px-3 py-1.5 text-sm rounded-md text-gray-600 hover:bg-gray-100 transition-colors"
+            >
+              詳細
+            </a>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-lg shadow p-4">
         <h2 className="text-lg font-semibold text-gray-800 mb-3">
           Players ({state?.players.length || 0})
@@ -135,11 +138,11 @@ function Now() {
         {state?.players && state.players.length > 0 ? (
           <ul className="divide-y divide-gray-100">
             {state.players.map((player, idx) => (
-              <li key={player.PlayerID || player.PlayerName || idx} className="py-2">
+              <li key={player.id || player.display_name || idx} className="py-2">
                 <div className="flex justify-between items-center">
-                  <span className="text-gray-900">{player.PlayerName || 'Unknown'}</span>
+                  <span className="text-gray-900">{player.display_name || 'Unknown'}</span>
                   <span className="text-xs text-gray-400">
-                    {new Date(player.JoinedAt).toLocaleTimeString()}
+                    {new Date(player.joined_at).toLocaleTimeString()}
                   </span>
                 </div>
               </li>

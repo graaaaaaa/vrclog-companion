@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
-	"github.com/graaaaa/vrclog-companion/internal/config"
+	"github.com/vrclog/vrclog-companion/internal/config"
 )
 
 // SendResult indicates the outcome of a send attempt.
@@ -83,14 +85,14 @@ func (s *DiscordSender) Send(ctx context.Context, payload DiscordPayload) (SendR
 	// but webhookURL itself logs as [REDACTED]
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.webhookURL.Value(), bytes.NewReader(body))
 	if err != nil {
-		s.logger.Error("failed to create request", "error", err)
+		s.logger.Error("failed to create request", "error", safeRequestErr(err))
 		return SendFatal, 0
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		s.logger.Warn("Discord request failed", "error", err)
+		s.logger.Warn("Discord request failed", "error", safeRequestErr(err))
 		return SendRetryable, 0
 	}
 	defer resp.Body.Close()
@@ -127,6 +129,21 @@ func (s *DiscordSender) Send(ctx context.Context, payload DiscordPayload) (SendR
 		s.logger.Warn("Discord request failed", "status", resp.StatusCode)
 		return SendRetryable, 0
 	}
+}
+
+// safeRequestErr strips the request URL from err before it is logged.
+// The Discord webhook URL carries its secret token in the path
+// (/api/webhooks/{id}/{token}), and *url.Error's Error() method embeds
+// the full URL verbatim — logging err directly would leak the token
+// through the webhook's [REDACTED]-protected config.Secret wrapper on
+// every transient network failure (DNS, connection refused, TLS,
+// timeout), not just a rare edge case.
+func safeRequestErr(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Op + ": " + uerr.Err.Error()
+	}
+	return err.Error()
 }
 
 func parseRetryAfter(header string) time.Duration {

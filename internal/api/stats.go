@@ -1,8 +1,6 @@
 package api
 
-import (
-	"net/http"
-)
+import "net/http"
 
 // handleStats handles GET /api/v1/stats/basic requests.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {

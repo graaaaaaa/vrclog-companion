@@ -1,11 +1,18 @@
 # VRClog Companion 仕様書
 
-## 0. プロジェクト識別子（命名の確定）
+作成日: 2026-08-19
+仕様状態: Normative（`CLAUDE_IMPLEMENTATION_SPEC.md` に基づく全面刷新後の製品仕様）
 
-* **GitHubリポジトリ名**：`vrclog-companion`
-* **配布バイナリ（Windows）**：`vrclog.exe`
-* **プロセス名（Windows）**：`vrclog.exe`
-* **アプリ表示名（UI/README）**：VRClog Companion（短縮：VRClog）
+このドキュメントは実装後の現行仕様である。旧 Event モデル・旧 SQLite スキーマ・旧 API との互換性はない。
+
+---
+
+## 0. プロジェクト識別子
+
+- **GitHub リポジトリ名**: `vrclog-companion`
+- **Go module path**: `github.com/vrclog/vrclog-companion`
+- **配布バイナリ（Windows）**: `vrclog.exe`
+- **アプリ表示名**: VRClog Companion（短縮: VRClog）
 
 ---
 
@@ -13,463 +20,410 @@
 
 ### 1.1 目的
 
-VRChat のローカルログを監視し、Join/Leave/World移動等のイベントを抽出して **ユーザーPC内のSQLiteに永続化**する。
-ユーザーは **ローカルHTTP API + Web UI（ブラウザ）** で履歴・現在状態・簡易統計を閲覧できる。
-イベント発生時には **Discord Webhook** を用いてスマホ等へ通知を届ける。
+VRClog Companion は VRChat のローカルログを受動的に監視し、`vrclog-go` の正規 `Observation` として **ユーザー PC 内の SQLite にのみ永続化** する。その Observation ストリームを World / Presence / Media の利用者向け状態へ投影（Projector）し、ローカル HTTP API + Web UI で提供する。ワールド内で再生できなかったメディアの元 URL を復元し、コピー・ブラウザ起動できることが主要なユースケースである。
 
-### 1.2 基本方針（最重要）
+### 1.2 基本方針
 
-* **中央DB／開発者サーバー無し**（開発者はログもトークンも保持しない）
-* データは **ユーザーPC内にのみ保存**
-* v1（本仕様）で **LANアクセス** を提供するが、**安全側デフォルト**で意図しない公開を防ぐ
-* UIは **ブラウザのみ**（Tauri/Electron等は対象外）
-* ライブ更新は **SSE**（必要になるまでこれで十分）
-* LINE Notify はサービス終了のため対象外
+- 中央サーバー・クラウドアップロード・テレメトリは一切ない
+- データはユーザー PC 内にのみ保存される
+- LAN アクセスは提供するが、安全側デフォルト（loopback bind, LAN 時は Basic Auth 必須）で意図しない公開を防ぐ
+- UI はブラウザのみ配布（Web UI を go:embed で同梱）
+- ライブ更新は SSE
+- VRChat プロセス・API とは一切連携しない（ログファイルの読み取りのみ）
 
-### 1.3 対応OS
+### 1.3 対応 OS
 
-* Windows 11（v1）
-
----
-
-## 2. スコープ
-
-### 2.1 v1で実現すること
-
-* VRChatログ監視（tail）
-* Join/Leave/World移動のイベント化（`vrclog-go` を利用）
-* SQLiteへ履歴保存
-* 重複排除（再起動・巻き戻り・ローテーション耐性）
-* 二重起動防止（単一インスタンス）
-* HTTP API提供（履歴／現在状態／簡易統計／SSE）
-* Web UI（SPAを同一サーバーから配布）
-* LANアクセス（設定ON時）
-* Discord通知（Webhook）
-
-### 2.2 v1で実施しないこと
-
-* 開発者運用のサーバー、クラウド同期、中央DB
-* LAN外アクセスの公式サポート（VPN/ポート開放等は自己責任）
-* Web Push（HTTPS要件等が重いため）
-* ネイティブGUI（Tauri/Electron）
-* LINE通知（Notify終了／Messaging API等はv2以降検討）
+- Windows 11（本番ターゲット）
+- macOS（開発用）
 
 ---
 
-## 3. 用語
-
-* **Companion**：ユーザーPC上で常駐する単一実行体（`vrclog.exe`）。
-* **Event**：ログから抽出した構造化イベント。
-* **Cursor**：ログ取り込み位置（どこまで処理したか）。
-* **Dedupe Key**：重複排除のための一意キー。
-* **Derive**：イベントから計算する現在状態（今のワールド、同席者）。
-
----
-
-## 4. ユースケース
-
-### 4.1 主要ユースケース
-
-1. VRChatプレイ中、同じインスタンスに人がJoinしたらDiscord通知が来る
-2. 後から「いつ誰と会ったか」「どのワールドにいたか」をWeb UIで見返す
-3. 同一LANのスマホから `http://<PC_IP>:<port>` を開き履歴を見る
-
----
-
-## 5. 全体アーキテクチャ
-
-### 5.1 コンポーネント
-
-* **Ingest**：`vrclog-go`でログ監視→Event受信
-* **Persist**：SQLiteへ保存（events）
-* **Cursor**：再起動耐性（ingest_cursor）
-* **Dedupe**：UNIQUE(dedupe_key)＋衝突時無視
-* **Derive**：現在状態トラッカー（メモリ）
-* **Notify**：Discord Webhook
-* **API**：HTTP API（JSON + SSE）
-* **UI**：静的配信（SPA、ブラウザ）
-
-### 5.2 データフロー
-
-1. VRChatログ → `vrclog-go` → Event受信
-2. `dedupe_key` 生成
-3. `INSERT ... ON CONFLICT DO NOTHING`（新規のみ保存）
-4. INSERT成功時のみ：Derive更新 / Discord通知 / SSE配信
-
----
-
-## 6. 機能要件
-
-## 6.1 ログ監視・イベント生成
-
-* `vrclog-go` を利用し、ログを tail する
-* イベント種別（v1）
-
-  * `player_join`
-  * `player_left`
-  * `world_join`
-* ログパス
-
-  * 自動検出（デフォルト）
-  * 手動指定（設定）
-* 起動時リプレイ（取りこぼし対策）
-
-  * DBの最終イベント時刻を取得し、**安全窓（例：5分）巻き戻して**リプレイする
-  * 既存イベントはDedupeで無害化する（再起動で増殖しない）
-
-## 6.2 SQLite永続化
-
-* DBファイル：`vrclog.sqlite`
-* DBは履歴のソース・オブ・トゥルース
-* SQLite初期化時の推奨設定
-
-  * WALモード
-  * busy_timeout
-  * 書き込みは短いトランザクション
-
-## 6.3 重複排除・二重通知抑止
-
-* `events.dedupe_key` に `UNIQUE` 制約
-* INSERT成功（新規）時のみ通知とSSEを実行
-* 二重起動を禁止（単一インスタンス）
-
-## 6.4 HTTP API
-
-* prefix：`/api/v1`
-* `health` / `now` / `events` / `stats/basic` / `stream(SSE)` / `auth/token` / `config`
-
-## 6.5 Web UI（ブラウザのみ）
-
-* `/` でSPA配信
-* 画面（v1）
-
-  * Now：現在状態＋直近イベント（SSE）
-  * History：履歴一覧（期間／種別フィルタ）
-  * Stats：簡易統計
-  * Settings：ログパス、LAN公開、認証、Discord、通知設定
-
-## 6.6 Discord通知
-
-* ユーザーがDiscord側でWebhook URLを作成し、設定に貼り付ける必要がある
-* 通知トリガー（v1）
-
-  * Join/Leave/World移動
-* バッチ化（スパム抑止）
-
-  * デフォルト 3 秒（設定可能）
-* 失敗時
-
-  * 429：バックオフ再送
-  * 401/403：設定不備としてUIに表示し通知停止
-
----
-
-## 7. セキュリティ要件
-
-## 7.1 バインド
-
-* デフォルト：`127.0.0.1:<port>`（LAN公開OFF）
-* LAN公開ON：`0.0.0.0:<port>`
-
-## 7.2 認証
-
-* LAN公開ON時：**HTTP Basic Auth必須**
-
-  * 初回ON時に強いランダムパスワードを生成し保存
-  * UI上で表示（ユーザーが変更可能）
-* localhostのみ：認証は任意
-
-## 7.3 注意喚起（README/UIに明記）
-
-* TLSなしBasic認証は盗聴耐性がないため、LAN内限定で運用すること
-* ポート開放・インターネット公開は非推奨、行う場合は自己責任（サポート外）
-
-## 7.4 CORS
-
-* 同一オリジン前提で最小化
-* LAN公開時でも許可Originを限定（保守的）
-
----
-
-## 8. 設定管理仕様
-
-## 8.1 分類
-
-* config（非機密）
-
-  * port, lan_enabled, log_path, ui設定, バッチ秒数等
-* secrets（機密）
-
-  * discord_webhook_url
-  * basic_auth_password（ユーザー名も必要なら）
-
-## 8.2 保存場所（Windows）
-
-`%LOCALAPPDATA%/vrclog/`
-
-* `config.json`
-* `secrets.dat`（または `secrets.json`、推奨は暗号化領域）
-* `vrclog.sqlite`
-* `logs/`
-
-## 8.3 書き込み要件
-
-* atomic write（tmp→rename）
-* schema_version
-* 機密情報はログに出さない（マスク）
-
-## 8.4 secrets保護
-
-* v1最低限：ファイル権限（同一ユーザーのみ）
-* 可能なら：Windows保護APIで暗号化（v1またはv1.1）
-
-## 8.5 安全状態の強制
-
-* lan_enabled を true にする操作では
-
-  * Basic Auth を強制ON
-  * パスワード未設定なら生成
-  * 警告表示
-    を必ず実行する
-
----
-
-## 9. DB設計（SQLite）
-
-## 9.1 `events`（必須）
-
-| 列              | 型          | 説明            |
-| -------------- | ---------- | ------------- |
-| id             | INTEGER PK | 単調増加ID        |
-| ts             | TEXT       | イベント時刻（UTC推奨） |
-| type           | TEXT       | イベント種別        |
-| player_name    | TEXT NULL  | プレイヤー名        |
-| player_id      | TEXT NULL  | 取得できる場合       |
-| world_id       | TEXT NULL  |               |
-| world_name     | TEXT NULL  |               |
-| instance_id    | TEXT NULL  |               |
-| meta_json      | TEXT NULL  | 拡張JSON        |
-| dedupe_key     | TEXT       | 重複排除キー        |
-| ingested_at    | TEXT       | 取り込み時刻        |
-| schema_version | INTEGER    | v1=1          |
-
-制約：
-
-* `UNIQUE(dedupe_key)`
-
-推奨インデックス：
-
-* `(ts)`
-* `(type, ts)`
-* `(player_name, ts)`（任意）
-* `(world_id, instance_id, ts)`（任意）
-
-## 9.2 `ingest_cursor`（必須）
-
-| 列               | 型          | 説明                  |
-| --------------- | ---------- | ------------------- |
-| id              | INTEGER PK |                     |
-| source_path     | TEXT       | 追跡ログファイル            |
-| source_identity | TEXT       | パス+mtime+size等のハッシュ |
-| byte_offset     | INTEGER    | 最後に処理した位置           |
-| updated_at      | TEXT       |                     |
-
-※ v1は「リプレイ＋Dedupe」で成立するため、byte_offsetが未実装でも致命ではないが、将来の精度向上のためにテーブルは用意する。
-
-## 9.3 `parse_failures`（推奨）
-
-| 列          | 型          | 説明 |
-| ---------- | ---------- | -- |
-| id         | INTEGER PK |    |
-| ts_guess   | TEXT NULL  |    |
-| line       | TEXT       | 生行 |
-| reason     | TEXT       |    |
-| log_file   | TEXT       |    |
-| created_at | TEXT       |    |
-
----
-
-## 10. 重複排除仕様（詳細）
-
-### 10.1 dedupe_key の基本
-
-* 生行（raw_line）を保存せず、ハッシュのみ利用する
-* v1の現実解（推奨）：
-
-  * `dedupe_key = SHA256(raw_line)`
-* 将来拡張（任意）：
-
-  * `SHA256(source_identity + ":" + offset + ":" + type + ":" + SHA256(raw_line))`
-
-### 10.2 重複時の動作
-
-* DBに挿入されなかった（衝突）イベントは
-
-  * Discord通知しない
-  * SSE配信しない
-  * Derive更新しない（または更新しない方を推奨）
-
----
-
-## 11. 派生状態（Derive）仕様
-
-* `world_join`：現在ワールド更新、同席者集合をリセット（v1）
-* `player_join`：集合に追加
-* `player_left`：集合から削除
-* `last_event_id`：最後にINSERTされたevents.id
-
----
-
-## 12. HTTP API仕様（v1）
-
-### 12.1 `GET /api/v1/health`
-
-```json
-{ "status": "ok", "version": "0.1.0" }
+## 2. 3リポジトリ契約
+
+```text
+vrclog-go          canonical Event, Record/Cursor, Engine, Follow/ReadFile
+  ← vrclog-adapters community Adapter（YamaPlayer, iwaSync3）
+    ← vrclog-companion（本リポジトリ）
 ```
 
-### 12.2 `GET /api/v1/now`
+Companion だけが所有する責務:
 
-現在のワールドとオンラインプレイヤーを返す。
+- Adapter 構成（compile-time）
+- Record 単位 ingest supervision
+- SQLite スキーマと CommitRecord トランザクション
+- Projector（World/Presence/Media）と通知ポリシー
+- HTTP API / SSE / Web UI
 
-```json
-{
-  "world": {
-    "world_id": "wrld_...",
-    "world_name": "Example World",
-    "instance_id": "12345~private(usr_...)~region(jp)",
-    "joined_at": "2025-01-01T12:00:00.000000000Z"
-  },
-  "players": [
-    {
-      "player_name": "Alice",
-      "player_id": "usr_...",
-      "joined_at": "2025-01-01T12:05:00.000000000Z"
+Companion は `vrclog-go` / `vrclog-adapters` の公開契約のみを使用する。独自 Parser・独自 Event 型・独自 Adapter interface は持たない。
+
+---
+
+## 3. データフロー
+
+```text
+VRChat output_log
+        │
+        ▼
+vrclog.Follow(ctx, FollowConfig{Cursor}) → iter.Seq2[Record, error]
+        │
+        ▼
+Engine.Process(record) → Result{ Observations, Diagnostics }
+        │
+        ▼
+Store.CommitRecord（単一 SQLite トランザクション）
+  ├─ observations INSERT（重複検知）
+  ├─ diagnostics INSERT OR IGNORE
+  └─ ingest_cursors UPSERT
+        │  COMMIT
+        ▼ （新規挿入された Observation のみ）
+Projector Manager.Apply(obs)
+  ├─ WorldProjector
+  ├─ PresenceProjector
+  └─ MediaProjector
+        │
+        ├─ SSE Broadcaster（generic `observation` event）
+        └─ Notifier（World/Player の Change のみ Discord へ）
+```
+
+---
+
+## 4. Adapter 構成
+
+`internal/adapter.BuildEngine()` がコンパイル時に Engine を構成する。
+
+```go
+core := vrclog.NewVRChatAdapter()
+community := adapters.All() // vrclog-adapters
+all := append([]vrclog.Adapter{core}, community...)
+engine, err := vrclog.NewEngine(all...)
+```
+
+- built-in（`vrchat.core`）を先頭に固定
+- `adapters.All()` の順序を保持
+- global init registry・実行時プラグイン読み込み・YAML パターン設定は存在しない
+
+現在ロードされる Adapter:
+
+| ID | Origin |
+|----|--------|
+| `vrchat.core` | core |
+| `community.yamaplayer` | community |
+| `community.iwasync3` | community |
+
+`GET /api/v1/adapters` で参照可能。
+
+---
+
+## 5. Ingest パイプライン
+
+### 5.1 RecordSource
+
+```go
+type RecordSource interface {
+    Records(ctx context.Context) iter.Seq2[vrclog.Record, error]
+}
+
+type RecordSourceFactory interface {
+    NewSource(ctx context.Context, cursor *vrclog.Cursor) (RecordSource, error)
+}
+```
+
+`VRChatSourceFactory` は `vrclog.Follow` を薄くラップする。カーソル付きで `ErrCursorSourceMissing` が発生した場合、警告を一度だけログ出力し、カーソルなしで再開始する（ループしない）。
+
+### 5.2 Runner
+
+`internal/ingest.Runner` が per-Record トランザクションループを駆動する。
+
+```text
+for record, err := range source.Records(ctx) {
+    result := engine.Process(record)
+    for {
+        commitResult, err := store.CommitRecord(ctx, RecordCommit{record, result, now})
+        if err == nil { break }
+        // bounded backoff (1s〜30s) でリトライ。次 Record へは進まない。
     }
-  ]
+    for obs := range commitResult.InsertedObservations {
+        onInsert(ctx, obs) // Projector.Apply → SSE broadcast → 通知
+    }
 }
 ```
 
-* `world` はワールド未参加時は `null`
-* `players` はワールド未参加時は空配列
+- **不変条件**: Observation/Diagnostic の保存と cursor 更新は同一トランザクションでコミットされる
+- 0 Observation の Record でも cursor は前進する
+- DB エラー時は同じ Record を bounded backoff でリトライし、次 Record を消費しない
+- Source 致命的エラー時は、最後にコミットされた cursor から `RecordSourceFactory` 経由で source を再構築する（bounded backoff, 1s〜30s）
 
-### 12.3 `GET /api/v1/events`
+### 5.3 Duplicate 判定
 
-* クエリ：`since`, `until`, `type`, `limit`, `cursor`
-* レスポンス：
+Observation identity は `vrclog.ObservationID` のみで判定する。raw line ハッシュや URL 正規化による重複排除は行わない。
 
-```json
-{ "items": [ ... ], "next_cursor": "..." }
+同一 ID が既に存在する場合、以下 9 フィールドを比較する:
+
+`occurred_at, type, payload_json, adapter_id, rule_id, record_id, source_id, source_offset, source_line`
+
+（`sequence`, `ingested_at` は除外）
+
+- 完全一致 → 既知の重複として無視（cursor は前進）
+- 不一致 → `ErrObservationConflict` でトランザクション全体をロールバック（cursor は前進しない）
+
+---
+
+## 6. SQLite スキーマ（version 2）
+
+`PRAGMA user_version` で管理する。**自動マイグレーションはない。**
+
+| 検出状態 | 挙動 |
+|---------|------|
+| `user_version == 2` | テーブル存在検証後に利用 |
+| `user_version == 0`、旧テーブルなし | schema 2 を新規作成 |
+| `user_version == 0`、旧テーブルあり（`events`/`ingest_cursor`/`parse_failures`） | fatal `ErrUnsupportedSchema` |
+| それ以外のバージョン | fatal `ErrUnsupportedSchema` |
+
+fatal 時はアプリを停止し、DB ファイルをリネームまたは削除して再作成する。
+
+```sql
+CREATE TABLE observations (
+    sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+    id             TEXT NOT NULL UNIQUE,
+    occurred_at    TEXT NOT NULL,
+    type           TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    adapter_id     TEXT NOT NULL,
+    rule_id        TEXT NOT NULL,
+    record_id      TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    source_offset  INTEGER NOT NULL,
+    source_line    INTEGER NOT NULL,
+    ingested_at    TEXT NOT NULL
+);
+
+CREATE TABLE ingest_cursors (
+    source_id     TEXT PRIMARY KEY,
+    path          TEXT NOT NULL,
+    byte_offset   INTEGER NOT NULL,
+    line_number   INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE diagnostics (
+    id             TEXT PRIMARY KEY,
+    record_id      TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    source_offset  INTEGER NOT NULL,
+    source_line    INTEGER NOT NULL,
+    adapter_id     TEXT,
+    rule_id        TEXT,
+    code           TEXT NOT NULL,
+    message        TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
 ```
 
-### 12.4 `GET /api/v1/stats/basic`
+- `ingest_cursors.path` は再開処理専用であり、Observation API には一切出さない
+- raw line は既定で保存しない（Diagnostic の message も URL 除去 + 512byte 上限で redact）
+- WAL mode, busy_timeout 5s, `_txlock=immediate`（CommitRecord が確実に書き込みロックを取得する）
 
-* 今日のJoin数、直近の人、ワールド遷移回数（簡易）
+---
 
-### 12.5 `GET /api/v1/stream`（SSE）
+## 7. Projector
 
-* `id:` はカーソル形式（base64エンコード、`ts|id`）
-* `event:` はイベント種別（`player_join`, `player_left`, `world_join`）
-* `data:` はイベントJSON
-* 切断時に購読解除
-* `Last-Event-ID` ヘッダまたは `last_event_id` クエリパラメータでの再接続リプレイ対応
-* ハートビート: 20秒間隔でコメント送信
+Observation は永続化された事実、Projector はそれを決定的に投影する派生状態。DB から常に再構築可能。
 
-認証（LAN公開時）:
-* Basic認証ヘッダ、または
-* `?token=...` クエリパラメータ（`POST /api/v1/auth/token` で発行）
-* ブラウザの `EventSource` API は Basic認証ヘッダを送信できないため、トークン認証を使用
+### 7.1 Manager 適用順序
 
-### 12.6 `POST /api/v1/auth/token`
+`Manager.Apply(obs)` は以下の順序を厳守する:
 
-SSE接続用の一時トークンを発行する（LAN公開時のみ）。
+1. World transition（`world.joining_observed` の場合）
+2. Presence reset（definitive transition の場合のみ）
+3. Media session reset（同上）
+4. Change 一覧を返却
+
+`Manager.Rebuild(ctx, allObservations)` は起動時に sequence 昇順で全 Observation を再生し、Change 発行を抑制する（通知・SSE を発生させない）。
+
+### 7.2 WorldProjector
+
+- `world.joining_observed` が definitive transition。同一 world ID + instance ID は重複として無視
+- `world.entering_observed` の名前は pending として保持し、15 秒以内（`OccurredAt` 基準、wall clock ではない）の joining と merge する
+- entering → joining, joining → entering のどちらの順序でも同じ最終状態になる
+- definitive transition のみ `WorldChanged` を発行し、Presence をリセットする
+
+### 7.3 PresenceProjector
+
+- キーは Player.ID が非空ならそれ、空なら trim 済み DisplayName
+- 重複 join は no-op、未知の left は no-op
+- World transition による reset では `PlayerLeft` を発行しない（離脱通知はしない）
+
+### 7.4 MediaProjector
+
+初期 status は `observed` / `failed` のみ（`playing` は判定材料がないため作らない）。
+
+**BestOpenableURL 優先順位**: `source` > `resolver_input` > `playback_input` > なし。`resolved`（signed CDN URL 等）は対象外。同一優先度内では最初に観測された URL を維持する。
+
+**Correlation（相関付け）優先順位**:
+
+1. exact target（component + key 完全一致。key が空の場合は対象外）
+2. exact URL 遷移（`resource.resolved` の input/output URL）
+3. exact resource URL 一致
+4. 単一の曖昧でない直近候補（10 秒以内、同一 world session、target 競合なし。`<=` で境界を含む）
+5. 新規 Attempt（0 件または複数曖昧 → 分離を優先）
+
+World transition を跨いだ correlation は行わない（`currentWorldInstanceID` でスコープ）。直近履歴（最大 50 件）は世代を跨いで保持される。
+
+`LatestOpenableMedia` は世代を問わず直近の BestOpenableURL 保持 Attempt を返す（failed でも対象）。
+
+---
+
+## 8. API
+
+Base path: `/api/v1`
+
+### 8.1 認証
+
+| Endpoint | Loopback | LAN モード |
+|----------|----------|-----------|
+| `GET /health` | 不要 | 不要 |
+| その他すべて | 不要 | Basic Auth 必須（`/stream` は SSE token も可） |
+
+`/auth/token` は Basic Auth のみ受理する（SSE token での自己更新は不可）。
+
+起動直後の Projector rebuild 中は `/health` 以外すべて `503 {"status":"rebuilding"}` を返す。
+
+### 8.2 `GET /api/v1/health`
 
 ```json
 {
-  "token": "base64_encoded_token",
-  "expires_in": 300
+  "status": "ok | degraded",
+  "database": "ok | error",
+  "ingest": "running | retrying | stopped | rebuilding",
+  "last_ingest_error": "",
+  "last_record_at": "",
+  "loaded_adapters": 3
 }
 ```
 
-* Basic認証が必要
-* トークンはSSE接続時のクエリパラメータ `?token=...` で使用
-* 有効期限: 5分
+secret・path・URL は一切含まない。
 
-### 12.7 `GET /api/v1/config`
+### 8.3 `GET /api/v1/observations`
 
-設定情報を取得する（シークレットは除外）。
+Query: `cursor`（sequence）, `limit`（1-500, default 100）, `type`（exact）, `adapter_id`（exact）, `since`, `until`（RFC3339）
+
+デフォルト順序は sequence 降順。`type`/`adapter_id` はアローリストを使わず SQL bind parameter で照合する。
 
 ```json
 {
-  "port": 8080,
-  "lan_enabled": false,
-  "log_path": "",
-  "discord_batch_sec": 3,
-  "notify_on_join": true,
-  "notify_on_leave": true,
-  "notify_on_world_join": true
+  "items": [{
+    "sequence": 42,
+    "id": "...",
+    "occurred_at": "...",
+    "type": "resource.url_observed",
+    "payload": {},
+    "adapter_id": "community.yamaplayer",
+    "rule_id": "youtube_resolve_url",
+    "record": { "id": "...", "source_id": "...", "offset": 1234, "line": 52 },
+    "ingested_at": "..."
+  }],
+  "next_cursor": 41
 }
 ```
 
-### 12.8 `PUT /api/v1/config`
+`next_cursor` は該当なしでも常にキーとして存在し、値は `null`（フィールド省略はしない — クライアントの `!== null` 判定を壊すため）。local path・raw line は含まない。
 
-設定を更新する。
+### 8.4 `GET /api/v1/state`
 
-* リクエストボディ: 更新する設定項目のJSON
-* レスポンス: `{ "success": true, "restart_required": false }`
-* `restart_required: true` の場合、ポート変更等で再起動が必要
+```json
+{
+  "world": { "id": "...", "name": "...", "instance_id": "...", "joined_at": "..." },
+  "players": [{ "id": "...", "display_name": "...", "joined_at": "..." }],
+  "latest_openable_media": { "attempt_id": "...", "url": "...", "status": "failed", "observed_at": "..." }
+}
+```
 
----
+### 8.5 `GET /api/v1/media/recent`
 
-## 13. Web UI仕様（v1）
+Query: `limit`（1-50, default 20）。新しい順で MediaAttempt を返す。
 
-* Now / History / Stats / Settings
-* レスポンシブ必須
-* LAN公開ON時はBasic認証を通してアクセスする
-* PWAは任意（Pushはv1対象外）
+### 8.6 `GET /api/v1/adapters`
 
----
+```json
+{ "adapters": [{ "id": "vrchat.core", "origin": "core" }] }
+```
 
-## 14. 配布・導入（v1）
+### 8.7 `GET /api/v1/stats/basic`, `GET/PUT /api/v1/config`, `POST /api/v1/auth/token`
 
-### 14.1 配布
-
-* GitHub Releases に `vrclog.exe` を提供
-* ソースはOSS
-
-### 14.2 初回チュートリアル（必須）
-
-* ログパス確認（自動検出）
-* Discord Webhook設定
-* LAN公開（OFF推奨、ON時は認証必須・警告表示）
-* Start/Stop
-
-### 14.3 自動起動
-
-* デフォルトOFF
-* 設定からON可能（チュートリアルで説明）
+既存パターンを維持。Stats は observations テーブルの集計と Projector Manager の直近メディア件数から算出する。
 
 ---
 
-## 15. 完了定義（v1）
+## 9. SSE
 
-* 2重起動不可
-* 再起動してもイベントが増殖しない（dedupe）
-* LAN OFFでは外部からアクセス不可
-* LAN ONではBasic認証なしでAPI/UIにアクセス不可
-* 新規イベントのみDiscord通知
-* SSEでUIがリアルタイム更新
-* DBがWAL設定で運用可能
+`GET /api/v1/stream` は単一イベント種別のみ送信する。
+
+```text
+id: <observation-id>
+event: observation
+data: <observation API JSON>
+```
+
+type ごとに SSE event 名は分けない。
+
+### 9.1 Last-Event-ID recovery
+
+1. Broadcaster に subscribe
+2. 現在の high-water sequence を取得
+3. Last-Event-ID から sequence を解決できなければ `event: reset`（`id:` 空）を送信して切断
+4. `(lastSeq, highWater]` の Observation を DB から backlog 送信
+5. 以降は live channel から `sequence > lastSent` のみ送信（dedup）
+
+subscribe と high-water 取得の間にコミットされた Observation は backlog か live channel のいずれかで必ずカバーされる。
+
+### 9.2 Backpressure
+
+per-client バッファが溢れた場合は ingest をブロックせず切断する。クライアントは Last-Event-ID で再接続して復旧する。
 
 ---
 
-## 付録：推奨リポジトリ構造
+## 10. 通知（Discord）
 
-* `cmd/vrclog/`（ビルド成果物は vrclog.exe）
-* `internal/store/`（SQLite）
-* `internal/ingest/`（vrclog-go）
-* `internal/derive/`（Now状態）
-* `internal/notify/`（Discord）
-* `internal/api/`（HTTP+SSE+Auth）
-* `web/`（SPA、ビルド成果物をembed）
+対象: definitive `WorldChanged`, `PlayerJoined`, `PlayerLeft` の Change のみ。
 
+非対象: `WorldNameUpdated`, `MediaAttemptUpdated`, startup rebuild 中の Change, duplicate。
+
+**サニタイズ**: 送信ペイロードは常に `allowed_mentions: {"parse": []}` を含める。プレイヤー名・ワールド名は Markdown 制御文字をエスケープし、`@everyone`/`@here`/`<@id>` のメンショントリガーと `http(s)://` の自動リンクをゼロ幅スペースで無害化する。
+
+メディア URL は一切送信しない。
+
+---
+
+## 11. セキュリティ・プライバシー
+
+- デフォルトは loopback bind。LAN モードのみ Basic Auth + rate limit + auth failure lockout + CSRF protection を有効化
+- Basic Auth は TLS なしでは盗聴保護がないため、LAN モードは信頼できるネットワークでのみ使用する
+- Diagnostics の message は DB 保存前・API 応答前の二重で redact する（URL 除去、512byte 上限）
+- Media URL は Discord へ送信しない、外部メタデータを取得しない、自動で開かない
+- ブラウザで開く操作は `http`/`https` スキームのみ許可
+- raw log line は DB にも API にも出さない
+
+---
+
+## 12. テスト方針
+
+- `internal/store`: schema 検証、CommitRecord 原子性、query
+- `internal/ingest`: Runner の DB/source リトライ、cursor missing fallback、VRChatSource 統合
+- `internal/projector`: World 二段階 merge、Presence、Media correlation（YamaPlayer/iwaSync3 シナリオ、境界値）
+- `internal/api`, `internal/sse`: ルーティング、認証、SSE backlog/race
+- `test/integration`: 実 SQLite + 実 HTTP サーバーでの統合テスト
+- `test/e2e`: `vrclog-adapters` の実フィクスチャを通した media URL recovery E2E
+
+---
+
+## 13. ビルド
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+go vet ./...
+GOOS=windows GOARCH=amd64 go build ./cmd/vrclog-companion/
+
+cd web && npm ci && npm run lint && npm run build
+```
