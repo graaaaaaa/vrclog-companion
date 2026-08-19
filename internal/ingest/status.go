@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	vrclog "github.com/vrclog/vrclog-go"
 )
 
 // State is the coarse ingest health state reported by /api/v1/health.
@@ -100,6 +102,16 @@ func publicErrorMessage(err error) string {
 			return truncateUTF8(reason, maxStatusErrorLen)
 		}
 		return truncateUTF8(pathErr.Op+": "+reason, maxStatusErrorLen)
+	}
+
+	// Known vrclog.Follow sentinel errors never carry a filesystem path,
+	// so they can be returned as fixed, non-path-bearing messages instead
+	// of relying on the best-effort regex fallback below.
+	switch {
+	case errors.Is(err, vrclog.ErrNoLogDirectory):
+		return "no log directory available"
+	case errors.Is(err, vrclog.ErrCursorSourceMissing):
+		return "cursor source file not found"
 	}
 
 	return truncateUTF8(redactPaths(err.Error()), maxStatusErrorLen)

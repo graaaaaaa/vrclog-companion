@@ -90,7 +90,7 @@ These hold regardless of future feature work — violating them is a regression,
 - **Projectors rebuild from DB.** `projector.Manager.Rebuild` replays all Observations in sequence order at startup and must reach the same state a live `Apply` sequence would. Never persist projector state as a separate source of truth.
 - **No legacy migration.** SQLite schema is versioned via `PRAGMA user_version`; any unexpected version is fatal, never auto-migrated. Old databases are reset by the user renaming/deleting the file, not by app code.
 - **Media URLs are sensitive.** Never sent to Discord, never auto-opened, never fed to external metadata lookups (no oEmbed/thumbnail/title fetch). Only `http`/`https` schemes may ever be presented as an "open in browser" action, and only on explicit user click.
-- **Generic SSE.** `/api/v1/stream` emits a single `event: observation` type; never add per-EventKind SSE event names. Last-Event-ID recovery uses the Broadcaster's high-water sequence to avoid a subscribe/live race — see `internal/sse` and `internal/api/stream.go`.
+- **Generic SSE.** `/api/v1/stream` emits a single `event: observation` type; never add per-EventKind SSE event names. Last-Event-ID recovery uses `Store.LatestSequence()` (DB-backed, correct immediately after a process restart) as the backlog bound, not `Broadcaster.HighWaterSequence()` (in-memory, resets to 0 on restart) — see `internal/sse` and `internal/api/stream.go`.
 - **Adapter composition is compile-time.** `internal/adapter.BuildEngine()` wires `vrclog.NewVRChatAdapter()` + `adapters.All()` in fixed order. No runtime plugin loading, no YAML pattern config, no remote adapter catalog.
 
 ## Key Design Decisions

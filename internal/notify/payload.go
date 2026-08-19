@@ -183,7 +183,7 @@ var mentionNeutralizer = strings.NewReplacer(
 	"<@", "<"+zeroWidthSpace+"@",
 )
 
-var urlSchemePattern = regexp.MustCompile(`(https?):/{2}`)
+var urlSchemePattern = regexp.MustCompile(`(?i)(https?):/{2}`)
 
 // sanitizeDiscordText prepares untrusted text (VRChat player/world names)
 // for inclusion in a Discord embed: Markdown control characters are

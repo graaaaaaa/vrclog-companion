@@ -83,21 +83,21 @@ function History() {
           limit: 50,
         })
 
-        setObservations((prev) => {
-          const merged = reset ? res.items : [...prev, ...res.items]
-          return merged.length > maxRetainedObservations
-            ? merged.slice(0, maxRetainedObservations)
-            : merged
-        })
+        const merged = reset ? res.items : [...observations, ...res.items]
+        const capped = merged.length > maxRetainedObservations
+        setObservations(capped ? merged.slice(0, maxRetainedObservations) : merged)
         setCursor(res.next_cursor)
-        setHasMore(res.next_cursor !== null)
+        // Once the retention cap is hit, further pages would be fetched
+        // only to be immediately discarded by the slice above — hide
+        // "Load more" instead of leaving a button that silently no-ops.
+        setHasMore(res.next_cursor !== null && !capped)
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unknown error')
       } finally {
         setLoading(false)
       }
     },
-    [typeFilter, cursor]
+    [typeFilter, cursor, observations]
   )
 
   useEffect(() => {

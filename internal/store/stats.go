@@ -48,10 +48,10 @@ func (s *Store) GetBasicStats(ctx context.Context, since, until time.Time) (*Bas
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT DISTINCT json_extract(payload_json, '$.player.display_name')
 		FROM observations
-		WHERE type = ?
+		WHERE type = ? AND occurred_at >= ? AND occurred_at < ?
 		ORDER BY sequence DESC
 		LIMIT 5
-	`, string(vrclog.EventKindPlayerJoined))
+	`, string(vrclog.EventKindPlayerJoined), sinceStr, untilStr)
 	if err != nil {
 		return nil, err
 	}

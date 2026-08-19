@@ -289,9 +289,40 @@ func (n *Notifier) flush(ctx context.Context) {
 		result, retryAfter := n.sender.Send(ctx, payload)
 		n.handleSendResult(result, retryAfter)
 
-		if result != SendOK {
-			break
+		if result == SendRetryable {
+			// A transient failure means this and any remaining payloads
+			// in the batch were never delivered. Put the whole batch
+			// back on the queue so the scheduled backoff retry has
+			// something to resend — without this, backoffUntil delays a
+			// retry of an already-empty queue and the notification is
+			// silently lost forever.
+			n.requeue(changes)
+			return
 		}
+		if result != SendOK {
+			// SendFatal: permanent failure (bad webhook config, 4xx).
+			// Retrying would never succeed, so drop and move on.
+			return
+		}
+	}
+}
+
+// requeue puts changes back at the front of the queue after a retryable
+// send failure and schedules a flush for when the backoff period set by
+// handleSendResult ends.
+func (n *Notifier) requeue(changes []projector.Change) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.queue = append(append([]projector.Change{}, changes...), n.queue...)
+	n.coalesceQueueLocked()
+	if len(n.queue) > n.maxQueueSize {
+		dropped := len(n.queue) - n.maxQueueSize
+		n.queue = n.queue[dropped:]
+		n.logger.Warn("queue overflow after requeue, dropped old changes", "dropped", dropped)
+	}
+	if n.timerHandle == nil {
+		n.timerHandle = n.afterFunc(time.Until(n.backoffUntil), n.triggerFlush)
 	}
 }
 

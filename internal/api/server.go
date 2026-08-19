@@ -29,6 +29,7 @@ type Server struct {
 	// SSE
 	broadcaster       *sse.Broadcaster
 	observationsStore SSEObservationStore
+	sseConnLimiter    *sseConnLimiter
 
 	// Auth configuration
 	authEnabled  bool
@@ -162,8 +163,9 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 			IdleTimeout:       60 * time.Second,
 			MaxHeaderBytes:    1 << 14, // 16KB - limit header size to prevent DoS
 		},
-		mux:    mux,
-		health: health,
+		mux:            mux,
+		health:         health,
+		sseConnLimiter: newSSEConnLimiter(),
 	}
 	s.ready.Store(true) // callers that manage startup rebuild call SetReady(false) explicitly
 	for _, opt := range opts {

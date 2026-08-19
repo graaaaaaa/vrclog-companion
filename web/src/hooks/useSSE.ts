@@ -78,7 +78,17 @@ export function useSSE(options: UseSSEOptions): UseSSEResult {
 
     const hasToken = await fetchAndSetToken()
     if (!hasToken) {
+      // No EventSource exists yet at this point, so es.onerror's backoff
+      // reconnect never fires -- without scheduling a retry here, a token
+      // fetch failing during the startup readiness-gate 503 window would
+      // leave SSE permanently disconnected until a manual page reload.
       setError('Failed to authenticate')
+      setReconnecting(true)
+      const delay = backoffRef.current
+      backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF)
+      reconnectTimerRef.current = window.setTimeout(() => {
+        connect()
+      }, delay)
       return
     }
 

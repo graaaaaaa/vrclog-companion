@@ -63,6 +63,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := extractIP(r)
+	if !s.sseConnLimiter.acquire(ip) {
+		writeError(w, http.StatusServiceUnavailable, "too many active streams", nil)
+		return
+	}
+	defer s.sseConnLimiter.release(ip)
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -131,12 +138,21 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveLastEventID looks up the sequence for a client-supplied
-// Last-Event-ID. If it cannot be resolved, it sends a reset event and
-// returns ok=false so the caller stops (the client is expected to refetch
-// full state rather than silently lose data).
+// Last-Event-ID and returns ok=false if the caller should stop.
+//
+// A reset event is sent only when the ID is genuinely unknown/stale
+// (found == nil) — the client is expected to refetch full state rather
+// than silently lose data. A transient store error (e.g. a busy SQLite
+// read) is NOT treated the same way: sending a reset would discard a
+// still-valid cursor over a temporary hiccup, so the connection is
+// closed without a reset and the client's next reconnect retries with
+// the same Last-Event-ID.
 func (s *Server) resolveLastEventID(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, lastEventID string) (sequence int64, ok bool) {
 	found, err := s.observationsStore.ObservationByID(ctx, vrclog.ObservationID(lastEventID))
-	if err != nil || found == nil {
+	if err != nil {
+		return 0, false
+	}
+	if found == nil {
 		writeSSEReset(w, flusher)
 		return 0, false
 	}

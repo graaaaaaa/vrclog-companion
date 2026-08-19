@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	vrclog "github.com/vrclog/vrclog-go"
 )
 
 // TestPublicErrorMessage_RedactsFilesystemPaths pins the CRITICAL fix: raw
@@ -53,6 +55,20 @@ func TestPublicErrorMessage_TruncatesLongMessages(t *testing.T) {
 	msg := publicErrorMessage(errors.New(strings.Repeat("x", 2000)))
 	if len(msg) > maxStatusErrorLen+len("…(truncated)")+4 {
 		t.Fatalf("publicErrorMessage did not truncate: len=%d", len(msg))
+	}
+}
+
+// TestPublicErrorMessage_KnownSentinelsGetFixedMessages hardens the
+// path-redaction fallback: known vrclog.Follow sentinel errors are
+// returned as fixed, non-path-bearing messages via an allowlist, rather
+// than relying solely on the best-effort regex fallback (which has a
+// known gap for space-containing paths in non-fs.PathError error text).
+func TestPublicErrorMessage_KnownSentinelsGetFixedMessages(t *testing.T) {
+	if got := publicErrorMessage(vrclog.ErrNoLogDirectory); got != "no log directory available" {
+		t.Errorf("publicErrorMessage(ErrNoLogDirectory) = %q", got)
+	}
+	if got := publicErrorMessage(vrclog.ErrCursorSourceMissing); got != "cursor source file not found" {
+		t.Errorf("publicErrorMessage(ErrCursorSourceMissing) = %q", got)
 	}
 }
 

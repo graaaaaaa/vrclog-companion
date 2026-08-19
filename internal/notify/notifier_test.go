@@ -296,6 +296,57 @@ func TestNotifier_BackoffOn429(t *testing.T) {
 	<-done
 }
 
+// TestNotifier_RetryableFailureResendsAfterBackoff pins the fix for a
+// real bug: flush() used to clear the queue before knowing whether the
+// send succeeded, so a SendRetryable failure permanently lost the batch
+// instead of resending it once the backoff period elapsed.
+func TestNotifier_RetryableFailureResendsAfterBackoff(t *testing.T) {
+	timerFactory := &FakeTimerFactory{}
+	sender := NewMockSender()
+	sender.SetResult(SendRetryable, 1*time.Millisecond)
+
+	n := NewNotifier(sender, 3, FilterConfig{
+		NotifyOnJoin: true,
+	}, WithAfterFunc(timerFactory.AfterFunc()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		n.Run(ctx)
+		close(done)
+	}()
+
+	n.Enqueue(makeJoinChange("Alice"))
+	time.Sleep(50 * time.Millisecond)
+	timerFactory.FireAll()
+	waitSend(t, sender)
+
+	if sender.CallCount() != 1 {
+		t.Fatalf("expected 1 call after first (retryable) attempt, got %d", sender.CallCount())
+	}
+
+	// Let the 1ms backoff actually elapse in wall-clock time, then fire
+	// the timer requeue() scheduled — this should resend the SAME
+	// change, proving it was not dropped.
+	sender.SetResult(SendOK, 0)
+	time.Sleep(50 * time.Millisecond)
+	timerFactory.FireAll()
+	waitSend(t, sender)
+
+	if sender.CallCount() != 2 {
+		t.Fatalf("expected 2 calls (retry resent the batch), got %d", sender.CallCount())
+	}
+	calls := sender.Calls()
+	if len(calls) != 2 || len(calls[1].Embeds) == 0 {
+		t.Fatalf("expected the retried payload to still contain Alice's change: %+v", calls)
+	}
+
+	cancel()
+	<-done
+}
+
 func TestNotifier_StopsOnFatal(t *testing.T) {
 	timerFactory := &FakeTimerFactory{}
 	sender := NewMockSender()
@@ -454,6 +505,28 @@ func TestPayload_SanitizesMentionsAndMarkdown(t *testing.T) {
 	}
 	if containsExact(desc, "**hack**") && !containsExact(desc, "\\*\\*hack\\*\\*") {
 		t.Errorf("markdown bold was not escaped: %q", desc)
+	}
+}
+
+// TestPayload_SanitizesUppercaseURLScheme pins the fix: the URL-scheme
+// neutralizer must catch case-variant schemes (HTTP://, HTTPS://), not
+// just lowercase ones, since this text is attacker-influenced (VRChat
+// player/world names).
+func TestPayload_SanitizesUppercaseURLScheme(t *testing.T) {
+	changes := []projector.Change{
+		projector.PlayerJoined{
+			Player: projector.PlayerInfo{DisplayName: "HTTP://evil.example HTTPS://also-evil.example"},
+			At:     time.Now(),
+		},
+	}
+	payloads := BuildPayloads(changes)
+	desc := payloads[0].Embeds[0].Description
+
+	if containsExact(desc, "HTTP://") {
+		t.Errorf("uppercase HTTP:// scheme was not neutralized: %q", desc)
+	}
+	if containsExact(desc, "HTTPS://") {
+		t.Errorf("uppercase HTTPS:// scheme was not neutralized: %q", desc)
 	}
 }
 

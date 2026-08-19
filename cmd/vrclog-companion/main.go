@@ -133,13 +133,12 @@ func main() {
 	}
 
 	onInsert := func(_ context.Context, obs observation.StoredObservation) {
-		broadcaster.Broadcast(obs)
-
 		changes, err := manager.Apply(obs)
 		if err != nil {
 			log.Printf("Warning: projector apply failed for observation %s: %v", obs.ID, err)
 			return
 		}
+		broadcaster.Broadcast(obs)
 		if notifier != nil {
 			for _, c := range changes {
 				notifier.Enqueue(c)

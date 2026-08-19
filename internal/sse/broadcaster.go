@@ -110,9 +110,12 @@ func (b *Broadcaster) disconnect(s *Subscriber) {
 	}
 }
 
-// HighWaterSequence returns the highest sequence broadcast so far. Used by
-// the SSE handler to bound DB backlog delivery and avoid a subscribe/live
-// race.
+// HighWaterSequence returns the highest sequence broadcast so far. It is
+// in-memory only and resets to 0 on process restart, so it must NOT be
+// used to bound SSE backlog delivery — that would silently truncate
+// backlog to nothing immediately after a restart. The SSE handler uses
+// Store.LatestSequence() (DB-backed) for that instead; this method exists
+// only for tests.
 func (b *Broadcaster) HighWaterSequence() int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

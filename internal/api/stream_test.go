@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 
 	vrclog "github.com/vrclog/vrclog-go"
 
+	"github.com/vrclog/vrclog-companion/internal/observation"
 	"github.com/vrclog/vrclog-companion/internal/sse"
 	"github.com/vrclog/vrclog-companion/internal/store"
 )
@@ -110,6 +112,63 @@ func TestStream_BacklogSurvivesRestart(t *testing.T) {
 	}
 	if strings.Contains(text, `"id":"obs1"`) {
 		t.Errorf("backlog re-delivered obs1, which the client already has: %s", text)
+	}
+}
+
+// erroringSSEStore's ObservationByID always returns a transient error,
+// regardless of the requested ID.
+type erroringSSEStore struct{}
+
+func (erroringSSEStore) ObservationByID(ctx context.Context, id vrclog.ObservationID) (*observation.StoredObservation, error) {
+	return nil, errors.New("database is locked")
+}
+
+func (erroringSSEStore) ObservationsAfterSequence(ctx context.Context, sequence int64, limit int) ([]observation.StoredObservation, error) {
+	return nil, nil
+}
+
+func (erroringSSEStore) LatestSequence(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
+// TestResolveLastEventID_TransientErrorDoesNotReset pins the fix: a
+// transient store error must NOT be treated the same as an unknown
+// cursor. Sending event:reset would needlessly discard an otherwise
+// valid Last-Event-ID over a temporary DB hiccup.
+func TestResolveLastEventID_TransientErrorDoesNotReset(t *testing.T) {
+	server := NewServer("127.0.0.1:0", testHealth(), WithBroadcaster(sse.NewBroadcaster(), erroringSSEStore{}))
+
+	rec := httptest.NewRecorder()
+	_, ok := server.resolveLastEventID(context.Background(), rec, rec, "some-id")
+
+	if ok {
+		t.Fatal("expected ok=false for a store error")
+	}
+	if body := rec.Body.String(); strings.Contains(body, "event: reset") {
+		t.Errorf("transient store error must not trigger event: reset, got body: %s", body)
+	}
+}
+
+// TestResolveLastEventID_UnknownCursorSendsReset confirms the reset path
+// still fires for a genuinely unresolvable Last-Event-ID (found == nil,
+// no error) — only the error-vs-unknown distinction changed.
+func TestResolveLastEventID_UnknownCursorSendsReset(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "resolve-test.sqlite"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	server := NewServer("127.0.0.1:0", testHealth(), WithBroadcaster(sse.NewBroadcaster(), st))
+
+	rec := httptest.NewRecorder()
+	_, ok := server.resolveLastEventID(context.Background(), rec, rec, "unknown-id")
+
+	if ok {
+		t.Fatal("expected ok=false for an unknown cursor")
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "event: reset") {
+		t.Errorf("expected event: reset for an unknown cursor, got body: %s", body)
 	}
 }
 
