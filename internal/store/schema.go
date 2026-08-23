@@ -6,9 +6,12 @@ import (
 )
 
 // CurrentSchemaVersion is the current database schema version, tracked via
-// PRAGMA user_version. Version 2 is the Observation/Projector schema; there
-// is no automatic migration path from any earlier version.
-const CurrentSchemaVersion = 2
+// PRAGMA user_version. Version 3 reflects the vrclog-go Observation ID
+// identity contract (emission index removed from the ID formula); table
+// structure is unchanged from version 2, but existing version 2 rows are
+// keyed by the old ID formula and are not compatible. There is no automatic
+// migration path from any earlier version, including 2.
+const CurrentSchemaVersion = 3
 
 // initSchema validates or creates the database schema.
 //

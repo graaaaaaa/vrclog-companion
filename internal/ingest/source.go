@@ -11,9 +11,31 @@ import (
 	vrclog "github.com/vrclog/vrclog-go"
 )
 
+// DeliveryPhase distinguishes a Record that existed on disk before the
+// current RecordSource started (catch-up, backfilled into the DB/Projector
+// without external side effects) from one that arrived afterward (live,
+// eligible for SSE broadcast and Discord notification). It is a per-Record
+// classification, never persisted — Store/Projector state does not depend
+// on it.
+type DeliveryPhase string
+
+const (
+	// DeliveryCatchUp marks a Record that was already on disk when the
+	// RecordSource's snapshot was captured.
+	DeliveryCatchUp DeliveryPhase = "catch_up"
+	// DeliveryLive marks a Record that arrived after the snapshot.
+	DeliveryLive DeliveryPhase = "live"
+)
+
+// SourceRecord pairs a Record with its DeliveryPhase.
+type SourceRecord struct {
+	Record vrclog.Record
+	Phase  DeliveryPhase
+}
+
 // RecordSource yields a stream of Records from one log source.
 type RecordSource interface {
-	Records(ctx context.Context) iter.Seq2[vrclog.Record, error]
+	Records(ctx context.Context) iter.Seq2[SourceRecord, error]
 }
 
 // RecordSourceFactory constructs a RecordSource resuming from cursor (nil

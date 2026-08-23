@@ -65,42 +65,54 @@ VRChat output_log
         │
         ▼
 vrclog.Follow(ctx, FollowConfig{Cursor}) → iter.Seq2[Record, error]
-        │
+        │  （LogSnapshot と比較して DeliveryPhase を確定: catch_up | live）
         ▼
 Engine.Process(record) → Result{ Observations, Diagnostics }
         │
         ▼
 Store.CommitRecord（単一 SQLite トランザクション）
-  ├─ observations INSERT（重複検知）
+  ├─ observations INSERT（重複検知。内容が異なる衝突は fatal）
   ├─ diagnostics INSERT OR IGNORE
   └─ ingest_cursors UPSERT
         │  COMMIT
-        ▼ （新規挿入された Observation のみ）
-Projector Manager.Apply(obs)
+        ▼ （新規挿入された Observation のみ、phase 付き）
+Projector Manager.Apply(obs)  ← catch_up / live どちらも必ず適用
   ├─ WorldProjector
   ├─ PresenceProjector
   └─ MediaProjector
         │
+        ▼ （phase == live のときだけ）
         ├─ SSE Broadcaster（generic `observation` event）
         └─ Notifier（World/Player の Change のみ Discord へ）
 ```
+
+catch-up（起動時・source 再接続時に読み直した既存ログ由来）の Observation は DB/Projector には反映されるが、SSE/Discord へは一切出さない。live（capture 後に到着したバイト由来）の Observation だけが外部 side effect を発生させる。詳細は §5.5。
 
 ---
 
 ## 4. Adapter 構成
 
-`internal/adapter.BuildEngine()` がコンパイル時に Engine を構成する。
+`internal/adapter.BuildEngine()` がコンパイル時に Engine を構成する。community adapter は集約パッケージを使わず、個別パッケージを明示的に import する — 新しい adapter はこのファイルの差分と review なしに有効化されない。
 
 ```go
+import (
+    "github.com/vrclog/vrclog-adapters/yamaplayer"
+    "github.com/vrclog/vrclog-adapters/iwasync3"
+)
+
 core := vrclog.NewVRChatAdapter()
-community := adapters.All() // vrclog-adapters
+community := []vrclog.Adapter{
+    yamaplayer.New(),
+    iwasync3.New(),
+}
 all := append([]vrclog.Adapter{core}, community...)
 engine, err := vrclog.NewEngine(all...)
 ```
 
 - built-in（`vrchat.core`）を先頭に固定
-- `adapters.All()` の順序を保持
+- community adapter の順序は上記コードの記述順（yamaplayer → iwasync3）で固定
 - global init registry・実行時プラグイン読み込み・YAML パターン設定は存在しない
+- `vrclog-adapters` の集約 `All()` は存在しない（個別パッケージのみが公開契約）
 
 現在ロードされる Adapter:
 
@@ -119,8 +131,20 @@ engine, err := vrclog.NewEngine(all...)
 ### 5.1 RecordSource
 
 ```go
+type DeliveryPhase string
+
+const (
+    DeliveryCatchUp DeliveryPhase = "catch_up"
+    DeliveryLive    DeliveryPhase = "live"
+)
+
+type SourceRecord struct {
+    Record vrclog.Record
+    Phase  DeliveryPhase
+}
+
 type RecordSource interface {
-    Records(ctx context.Context) iter.Seq2[vrclog.Record, error]
+    Records(ctx context.Context) iter.Seq2[SourceRecord, error]
 }
 
 type RecordSourceFactory interface {
@@ -128,32 +152,37 @@ type RecordSourceFactory interface {
 }
 ```
 
-`VRChatSourceFactory` は `vrclog.Follow` を薄くラップする。カーソル付きで `ErrCursorSourceMissing` が発生した場合、警告を一度だけログ出力し、カーソルなしで再開始する（ループしない）。
+`VRChatSourceFactory` は `vrclog.Follow` を薄くラップする。カーソル付きで `ErrCursorSourceMissing` が発生した場合、警告を一度だけログ出力し、カーソルなしで再開始する（ループしない、同じ `NewSource` 呼び出し内で completes）。`NewSource` は呼ばれるたびに `vrclog.CaptureLogSnapshot` で新しい LogSnapshot を取得し、各 Record の phase をそれで判定する（§5.5）。
 
 ### 5.2 Runner
 
 `internal/ingest.Runner` が per-Record トランザクションループを駆動する。
 
 ```text
-for record, err := range source.Records(ctx) {
-    result := engine.Process(record)
+for sr, err := range source.Records(ctx) {
+    result := engine.Process(sr.Record)
     for {
-        commitResult, err := store.CommitRecord(ctx, RecordCommit{record, result, now})
+        commitResult, err := store.CommitRecord(ctx, RecordCommit{sr.Record, result, now})
         if err == nil { break }
-        // bounded backoff (1s〜30s) でリトライ。次 Record へは進まない。
+        if conflict { fatal: ErrIntegrityViolation, StateFailed, Run() が error を返す }
+        // それ以外の DB エラーは bounded backoff (1s〜30s) でリトライ。次 Record へは進まない。
     }
     for obs := range commitResult.InsertedObservations {
-        onInsert(ctx, obs) // Projector.Apply → SSE broadcast → 通知
+        if err := onInsert(ctx, sr.Phase, obs); err != nil {
+            fatal: ErrProjectionFailure, StateFailed, Run() が error を返す
+        }
+        // onInsert 内部: Projector.Apply（両 phase）→ phase==live のときだけ SSE broadcast + 通知
     }
 }
 ```
 
 - **不変条件**: Observation/Diagnostic の保存と cursor 更新は同一トランザクションでコミットされる
 - 0 Observation の Record でも cursor は前進する
-- DB エラー時は同じ Record を bounded backoff でリトライし、次 Record を消費しない
-- Source 致命的エラー時は、最後にコミットされた cursor から `RecordSourceFactory` 経由で source を再構築する（bounded backoff, 1s〜30s）
+- DB エラー（transient）時は同じ Record を bounded backoff でリトライし、次 Record を消費しない
+- Source 致命的エラー時は、最後にコミットされた cursor から `RecordSourceFactory` 経由で source を再構築する（bounded backoff, 1s〜30s）。1 Record 以上を正常 commit した source run は progress ありとし、次に source が失敗したときの backoff attempt カウンタを 0 へリセットする
+- Observation conflict と post-commit Projector 適用失敗は fatal（§5.4）で、backoff/retry の対象にならない
 
-### 5.3 Duplicate 判定
+### 5.3 Duplicate 判定と Conflict の fatal 化
 
 Observation identity は `vrclog.ObservationID` のみで判定する。raw line ハッシュや URL 正規化による重複排除は行わない。
 
@@ -166,20 +195,52 @@ Observation identity は `vrclog.ObservationID` のみで判定する。raw line
 - 完全一致 → 既知の重複として無視（cursor は前進）
 - 不一致 → `ErrObservationConflict` でトランザクション全体をロールバック（cursor は前進しない）
 
+### 5.4 Fatal エラーと controlled shutdown
+
+競合する Observation を dropして再commitする処理は **存在しない**。同一 ID で内容が異なる衝突は決定的な整合性違反であり、以下の扱いになる。
+
+| エラー種別 | sentinel | 挙動 |
+|-----------|----------|------|
+| Observation content conflict | `ErrIntegrityViolation` | commit 済みの trx はロールバック済み。cursor 不変。diagnostic を書かない。`Runner.Status().State` = `StateFailed`。`Run()` が error を返す |
+| Post-commit Projector Apply 失敗 | `ErrProjectionFailure` | Observation は既に commit・cursor 前進済み（ロールバック不可）。`StateFailed`。`Run()` が error を返す。再起動時の Rebuild で一貫状態に戻る |
+
+`cmd/vrclog-companion/main.go` は `run() error` パターンで、Runner の fatal error を error channel 経由で受け取り、cancel → notifier → SSE → HTTP → DB の順で controlled shutdown し、プロセスは非ゼロで終了する。復旧手順は「アプリを停止し、DB ファイルをリネームまたは削除して再起動する」（§6 と同じ）。
+
+fatal エラーの内部ログには `observation_id`, `adapter_id`, `rule_id` を含めて診断可能にするが、`/api/v1/health` のような未認証エンドポイントには固定文字列（`"integrity violation"` / `"projection failure"`）のみを返し、詳細は漏らさない。
+
+### 5.5 Catch-up / Live delivery phase
+
+初回起動・アプリ再起動・source 再接続のたびに、source 開始前から既に disk 上に存在していたログを DB/Projector へ backfill しつつ、新着通知として扱わないための区別。
+
+- `RecordSourceFactory.NewSource` が呼ばれるたび（source retry を含む）に `vrclog.CaptureLogSnapshot` で新しい LogSnapshot を取得する
+- 各 Record は `snapshot.Contains(record)`（`record.NextOffset <= captured size`）で phase を判定する。timestamp 比較は使用しない
+- capture 時に存在したバイトの範囲内 → `catch_up`、capture 後に追記・新規作成されたファイル由来 → `live`
+- source retry で蓄積した Record も同じ仕組みで catch-up 扱いになり、復旧時の通知 burst を防ぐ
+
+| | Store | Cursor | Projector | SSE | Discord |
+|---|---|---|---|---|---|
+| catch_up | ○ | ○ | ○ | × | × |
+| live | ○ | ○ | ○ | ○ | Change filter に従う |
+
+readiness（`/api/v1/health` 以外の 503 解除）は DB schema 検証と起動時 Projector Rebuild の完了のみを意味し、catch-up の完了を待たない。
+
 ---
 
-## 6. SQLite スキーマ（version 2）
+## 6. SQLite スキーマ（version 3）
 
 `PRAGMA user_version` で管理する。**自動マイグレーションはない。**
 
+version 3 は `vrclog-go` の Observation ID 公式変更（emission index 削除）を反映したものである。テーブル構造は version 2 と同一だが、ID の identity contract が変わったため version を上げている。**version 2 の DB はそのまま使えず、明確に拒否される。**
+
 | 検出状態 | 挙動 |
 |---------|------|
-| `user_version == 2` | テーブル存在検証後に利用 |
-| `user_version == 0`、旧テーブルなし | schema 2 を新規作成 |
+| `user_version == 3` | テーブル存在検証後に利用 |
+| `user_version == 0`、旧テーブルなし | schema 3 を新規作成 |
 | `user_version == 0`、旧テーブルあり（`events`/`ingest_cursor`/`parse_failures`） | fatal `ErrUnsupportedSchema` |
+| `user_version == 2`（旧 Observation ID 形式） | fatal `ErrUnsupportedSchema` |
 | それ以外のバージョン | fatal `ErrUnsupportedSchema` |
 
-fatal 時はアプリを停止し、DB ファイルをリネームまたは削除して再作成する。
+fatal 時はアプリを停止し、DB ファイルをリネームまたは削除して再作成する。エラーメッセージにこの手順を含める。
 
 ```sql
 CREATE TABLE observations (
@@ -257,19 +318,50 @@ Observation は永続化された事実、Projector はそれを決定的に投�
 
 初期 status は `observed` / `failed` のみ（`playing` は判定材料がないため作らない）。
 
-**BestOpenableURL 優先順位**: `source` > `resolver_input` > `playback_input` > なし。`resolved`（signed CDN URL 等）は対象外。同一優先度内では最初に観測された URL を維持する。
+**BestOpenableURL 優先順位**: `source` > `resolver_input` > `playback_input` > なし。`resolved`（signed CDN URL 等）は対象外。同一優先度内では最初に観測された URL を維持する。`ResourceResolved` の `Input` は元の Role（通常 `resolver_input`）のまま保持されるため、`ResourceResolved` 単独（先行する `ResourceURLObserved` なし）でも Input が BestOpenableURL 候補になる。
 
-**Correlation（相関付け）優先順位**:
+**時間窓**（すべて `OccurredAt` 基準、`<=` で境界を含む — rebuild と live で同一の判定になる）:
 
-1. exact target（component + key 完全一致。key が空の場合は対象外）
-2. exact URL 遷移（`resource.resolved` の input/output URL）
-3. exact resource URL 一致
-4. 単一の曖昧でない直近候補（10 秒以内、同一 world session、target 競合なし。`<=` で境界を含む）
-5. 新規 Attempt（0 件または複数曖昧 → 分離を優先）
+| 定数 | 値 | 用途 |
+|------|-----|------|
+| `mediaCorrelationWindow` | 10 秒 | exact target / exact URL / 単一曖昧候補、すべてに一律適用 |
+| `mediaSourceDuplicateWindow` | 2 秒 | `role=source` の重複バースト判定専用 |
+
+**`role=source` の相関規則**（§7.4.1）: 原則として常に新規 Attempt を開始する。既存 Attempt へ merge してよいのは、次を **すべて** 満たす「重複バースト」だけ — exact 同一 URL、`mediaSourceDuplicateWindow`（2秒）以内、target が競合しない、current world session。同一 target でも URL が異なれば新規、同一 URL でも 2 秒を超えれば新規。exact target 一致だけでは `role=source` の merge 条件に **ならない**。
+
+**`resolver_input` / `playback_input` 等（`role=source` 以外の `ResourceURLObserved`）の相関順位**:
+
+1. exact target（component + key 完全一致、`mediaCorrelationWindow` 以内、target 競合なし）
+2. exact URL 一致（`mediaCorrelationWindow` 以内、target 競合なし）
+3. 単一の曖昧でない直近候補（`mediaCorrelationWindow` 以内、同一 world session、target 競合なし）
+4. 新規 Attempt
+
+**`ResourceResolved` の相関順位**:
+
+1. Input URL 一致（`mediaCorrelationWindow` 以内）
+2. exact target（同上）
+3. Output URL 一致（同上）
+4. 単一の曖昧でない直近候補
+5. 新規 Attempt
+
+相関後、**Input と Output の両方**を Resources へ追加する。それぞれ canonical Event の Kind/Role/URL をそのまま保持し、Output を強制的に `role=resolved` へ上書きしない（実質的に core adapter は Output に `resolved` を設定するため、通常は同じ結果になる）。
+
+**MediaErrorObserved の相関順位**:
+
+1. Resource URL があれば exact URL 一致（`mediaCorrelationWindow` 以内）
+2. exact target（同上）
+3. 単一の曖昧でない直近候補
+4. 新規 Attempt
+
+いずれも複数の曖昧な候補（2件以上）がある場合は merge せず新規 Attempt にする（誤 merge より分離を優先）。
 
 World transition を跨いだ correlation は行わない（`currentWorldInstanceID` でスコープ）。直近履歴（最大 50 件）は世代を跨いで保持される。
 
 `LatestOpenableMedia` は世代を問わず直近の BestOpenableURL 保持 Attempt を返す（failed でも対象）。
+
+### 7.5 Immutability
+
+`Change`（`MediaAttemptUpdated.Attempt`, `WorldChanged.Current`/`Previous`, `WorldNameUpdated.Current`）と `Snapshot`、`RecentMedia()` の返り値はすべて内部状態から独立した deep copy である。呼び出し側が返り値やそのスライス・ポインタフィールドを mutate しても、Manager の内部状態や後続の `Snapshot()`/`RecentMedia()` の結果には一切影響しない。`cloneMediaAttempt` が単一の clone 契約として、Change 発行・`recentSnapshot`・将来の API DTO 変換すべてで使われる。
 
 ---
 
@@ -294,14 +386,14 @@ Base path: `/api/v1`
 {
   "status": "ok | degraded",
   "database": "ok | error",
-  "ingest": "running | retrying | stopped | rebuilding",
+  "ingest": "running | retrying | stopped | failed | rebuilding",
   "last_ingest_error": "",
   "last_record_at": "",
   "loaded_adapters": 3
 }
 ```
 
-secret・path・URL は一切含まない。
+`ingest: "failed"` は fatal な integrity violation または post-commit projection failure の後の終端状態を示す（`status` は他の non-running 状態と同様 `degraded`。専用の health status は設けない）。secret・path・URL は一切含まない。
 
 ### 8.3 `GET /api/v1/observations`
 
@@ -402,6 +494,8 @@ per-client バッファが溢れた場合は ingest をブロックせず切断�
 - Media URL は Discord へ送信しない、外部メタデータを取得しない、自動で開かない
 - ブラウザで開く操作は `http`/`https` スキームのみ許可
 - raw log line は DB にも API にも出さない
+- `Server` は既定で not-ready（`SetReady(true)` を呼ぶまで `/health` 以外 503）
+- SSE（`/api/v1/stream`）は無期限接続を許すため server-global write timeout を無効化しているが、それ以外のルートは `http.TimeoutHandler`（既定 15 秒）でハンドラ実行時間全体を bound する — global timeout=0 だけでは非 SSE ルートが無制限に stall しうるため
 
 ---
 
@@ -420,10 +514,17 @@ per-client バッファが溢れた場合は ingest をブロックせず切断�
 
 ```bash
 gofmt -w .
-go test ./...
-go test -race ./...
 go vet ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
+go test -tags=integration -count=1 ./test/integration/...
+go test -tags=e2e -count=1 ./test/e2e/...
 GOOS=windows GOARCH=amd64 go build ./cmd/vrclog-companion/
 
 cd web && npm ci && npm run lint && npm run build
+
+go mod tidy
+git diff --exit-code -- go.mod go.sum
 ```
+
+CI は Windows/Ubuntu 双方でのユニット/integration/E2E テストに加え、Ubuntu 上で `go test -race` を独立ジョブとして実行する。Release workflow は `verify` job（上記コマンド一式）が成功したときのみ Windows バイナリのビルド・公開に進む — tag push だけで未検証の artifact が公開されることはない。

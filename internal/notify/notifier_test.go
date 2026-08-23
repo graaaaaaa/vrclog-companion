@@ -144,7 +144,7 @@ func makeLeaveChange(name string) projector.Change {
 
 func makeWorldChange(worldName string) projector.Change {
 	return projector.WorldChanged{
-		Current: &projector.CurrentWorld{ID: "wrld_123", Name: worldName, InstanceID: "inst_1", JoinedAt: time.Now()},
+		Current: projector.CurrentWorld{ID: "wrld_123", Name: worldName, InstanceID: "inst_1", JoinedAt: time.Now()},
 		At:      time.Now(),
 	}
 }
@@ -248,8 +248,8 @@ func TestNotifier_MediaAndNameUpdateNeverNotify(t *testing.T) {
 		NotifyOnJoin: true,
 	}, WithAfterFunc(timerFactory.AfterFunc()))
 
-	n.Enqueue(projector.WorldNameUpdated{Current: &projector.CurrentWorld{Name: "X"}, At: time.Now()})
-	n.Enqueue(projector.MediaAttemptUpdated{Attempt: &projector.MediaAttempt{ID: "a1"}, At: time.Now()})
+	n.Enqueue(projector.WorldNameUpdated{Current: projector.CurrentWorld{Name: "X"}, At: time.Now()})
+	n.Enqueue(projector.MediaAttemptUpdated{Attempt: projector.MediaAttempt{ID: "a1"}, At: time.Now()})
 
 	if n.QueueLength() != 0 {
 		t.Fatalf("QueueLength() = %d, want 0 (media/name-update must never notify)", n.QueueLength())

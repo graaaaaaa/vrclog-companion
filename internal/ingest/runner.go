@@ -13,11 +13,21 @@ import (
 	"github.com/vrclog/vrclog-companion/internal/store"
 )
 
-// diagnosticCodeObservationConflict marks a Companion-synthesized
-// Diagnostic recording that a conflicting Observation was dropped from
-// ingest rather than retried forever. It is not one of vrclog-go's own
-// DiagnosticCode values — the diagnostics table's code column is free text.
-const diagnosticCodeObservationConflict vrclog.DiagnosticCode = "observation_conflict"
+// ErrIntegrityViolation marks a fatal, non-retryable ingest failure caused
+// by the committed Observation stream itself being inconsistent — a
+// same-ID-different-content conflict (store.ErrObservationConflict). This
+// is never retried and never silently dropped: Run returns the error,
+// StateFailed is set, and the process is expected to exit non-zero so the
+// operator can rename/delete the DB file and restart.
+var ErrIntegrityViolation = errors.New("ingest integrity violation")
+
+// ErrProjectionFailure marks a fatal, non-retryable failure of the
+// OnInsert callback (Projector Apply) for an Observation that has already
+// been committed. It is intentionally distinct from ErrIntegrityViolation:
+// the DB itself is not inconsistent — replaying it via Rebuild on restart
+// is expected to restore a consistent Projector state — so this is not a
+// DB-corruption signal an operator should respond to by deleting the DB.
+var ErrProjectionFailure = errors.New("post-commit projection failure")
 
 // RecordStore is the subset of *store.Store the Runner depends on.
 type RecordStore interface {
@@ -35,9 +45,14 @@ type Clock func() time.Time
 
 // OnInsertFunc is called once per newly inserted Observation, in Engine
 // emission order, after its enclosing CommitRecord transaction has
-// committed. It must not block for long — it typically fans out to
-// Projectors, SSE, and notifications.
-type OnInsertFunc func(ctx context.Context, obs observation.StoredObservation)
+// committed. It must not block for long — it typically applies the
+// Observation to the Projector and, for phase == DeliveryLive, fans out to
+// SSE and notifications. A non-nil return is fatal: the DB row is already
+// committed and cannot be rolled back, so the Runner stops with
+// ErrProjectionFailure rather than silently leaving Projector state
+// inconsistent; a restart's Projector Rebuild replays from the DB to
+// recover.
+type OnInsertFunc func(ctx context.Context, phase DeliveryPhase, obs observation.StoredObservation) error
 
 const (
 	dbRetryInitialDelay = 1 * time.Second
@@ -135,6 +150,11 @@ func (r *Runner) Status() Status {
 // shutdown. Source-level failures (including the source factory itself
 // failing) are retried with bounded backoff, rebuilding the RecordSource
 // from the last successfully committed cursor; they do not stop the Runner.
+//
+// A fatal error from runSource (ErrIntegrityViolation or
+// ErrProjectionFailure) is never retried: Run returns it immediately with
+// StateFailed already set, for the caller to treat as a controlled-shutdown
+// trigger.
 func (r *Runner) Run(ctx context.Context) error {
 	cursor, err := r.store.LatestCursor(ctx)
 	if err != nil {
@@ -160,9 +180,13 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		r.status.setState(StateRunning)
-		newCursor, runErr := r.runSource(ctx, source)
+		newCursor, madeProgress, runErr := r.runSource(ctx, source)
 		if newCursor != nil {
 			cursor = newCursor
+		}
+
+		if isFatal(runErr) {
+			return runErr
 		}
 
 		if ctx.Err() != nil {
@@ -172,6 +196,14 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		if runErr != nil {
 			r.status.recordError(runErr)
+		}
+		if madeProgress {
+			// At least one Record committed successfully during this source
+			// run: the prior failure streak, if any, is resolved. The next
+			// source failure (if it happens) starts backoff from scratch
+			// rather than continuing to escalate from attempts that
+			// happened before recovery.
+			attempt = 0
 		}
 		// Whether the source ended cleanly (runErr == nil, e.g. Follow's
 		// iterator returned without ctx being done — not expected in
@@ -185,19 +217,29 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
+// isFatal reports whether err is a non-retryable ingest failure that must
+// stop the Runner entirely rather than trigger source-level backoff/retry.
+func isFatal(err error) bool {
+	return errors.Is(err, ErrIntegrityViolation) || errors.Is(err, ErrProjectionFailure)
+}
+
 // runSource consumes one RecordSource until it ends (cleanly, fatally, or
-// via ctx cancellation), returning the last cursor committed and, if the
-// source ended with a genuine error, that error.
-func (r *Runner) runSource(ctx context.Context, source RecordSource) (lastCursor *vrclog.Cursor, err error) {
+// via ctx cancellation), returning the last cursor committed, whether at
+// least one Record was committed successfully during this run, and — if
+// the source ended with a genuine error — that error. A fatal error
+// (ErrIntegrityViolation, ErrProjectionFailure) already has StateFailed set
+// by the time it is returned.
+func (r *Runner) runSource(ctx context.Context, source RecordSource) (lastCursor *vrclog.Cursor, madeProgress bool, err error) {
 	dbAttempt := 0
 
-	for record, recErr := range source.Records(ctx) {
+	for sr, recErr := range source.Records(ctx) {
 		if ctx.Err() != nil {
-			return lastCursor, nil
+			return lastCursor, madeProgress, nil
 		}
 		if recErr != nil {
-			return lastCursor, recErr
+			return lastCursor, madeProgress, recErr
 		}
+		record := sr.Record
 
 		result := r.engine.Process(record)
 
@@ -209,34 +251,47 @@ func (r *Runner) runSource(ctx context.Context, source RecordSource) (lastCursor
 			})
 			if commitErr == nil {
 				dbAttempt = 0
+				madeProgress = true
 				cur := commitResult.Cursor
 				lastCursor = &cur
 				r.status.recordSuccess(record.Time)
 
 				for _, obs := range commitResult.InsertedObservations {
-					if r.onInsert != nil {
-						r.onInsert(ctx, obs)
+					if r.onInsert == nil {
+						continue
+					}
+					if insertErr := r.onInsert(ctx, sr.Phase, obs); insertErr != nil {
+						fatalErr := fmt.Errorf(
+							"projector apply failed for observation %s (adapter=%s rule=%s): %w",
+							obs.ID, obs.AdapterID, obs.RuleID, ErrProjectionFailure,
+						)
+						r.status.setFailed(fatalErr)
+						return lastCursor, madeProgress, fatalErr
 					}
 				}
 				break
 			}
 
-			// An Observation conflict is deterministic, not transient:
-			// retrying the same Result unchanged will fail identically
-			// forever, permanently blocking all downstream ingest. Drop the
-			// offending Observation, record why, and retry immediately —
-			// this still advances the cursor once the rest commits cleanly,
-			// rather than silently overwriting the conflicting content.
+			// A same-ID-different-content Observation conflict is a fatal
+			// integrity violation, not a transient failure: the store
+			// transaction has already rolled back (cursor unchanged), and
+			// retrying the same Result would fail identically forever. It
+			// is never dropped and never retried — the operator must
+			// rename/delete the DB file and restart (spec §4.3).
 			var conflictErr *store.ObservationConflictError
 			if errors.As(commitErr, &conflictErr) {
-				result = dropConflictingObservation(result, conflictErr.ID)
-				r.status.recordError(commitErr)
-				continue
+				conflictingAdapterID, conflictingRuleID := conflictingObservationDiagnostics(result, conflictErr.ID)
+				fatalErr := fmt.Errorf(
+					"observation %s conflicts with a differently-encoded stored row (adapter=%s rule=%s): %w: %w",
+					conflictErr.ID, conflictingAdapterID, conflictingRuleID, ErrIntegrityViolation, commitErr,
+				)
+				r.status.setFailed(fatalErr)
+				return lastCursor, madeProgress, fatalErr
 			}
 
 			r.status.recordError(commitErr)
 			if !sleepBackoff(ctx, r.dbRetryInitialDelay, r.dbRetryMaxDelay, dbAttempt) {
-				return lastCursor, nil
+				return lastCursor, madeProgress, nil
 			}
 			dbAttempt++
 			// Retry the SAME record on the next loop iteration; the next
@@ -244,38 +299,20 @@ func (r *Runner) runSource(ctx context.Context, source RecordSource) (lastCursor
 		}
 	}
 
-	return lastCursor, nil
+	return lastCursor, madeProgress, nil
 }
 
-// dropConflictingObservation removes the Observation with the given ID from
-// result.Observations and appends a Diagnostic explaining why, so the next
-// CommitRecord attempt for this Record can succeed instead of retrying an
-// unresolvable conflict forever.
-func dropConflictingObservation(result vrclog.Result, id vrclog.ObservationID) vrclog.Result {
-	filtered := make([]vrclog.Observation, 0, len(result.Observations))
-	var dropped *vrclog.Observation
+// conflictingObservationDiagnostics finds the AdapterID/RuleID of the
+// Observation in result that caused a conflict, for fatal-error diagnostic
+// context. Returns empty strings if not found (should not happen in
+// practice, since the conflict came from committing this exact result).
+func conflictingObservationDiagnostics(result vrclog.Result, id vrclog.ObservationID) (adapterID, ruleID string) {
 	for _, obs := range result.Observations {
 		if obs.ID == id {
-			o := obs
-			dropped = &o
-			continue
+			return string(obs.AdapterID), string(obs.RuleID)
 		}
-		filtered = append(filtered, obs)
 	}
-	result.Observations = filtered
-
-	diag := vrclog.Diagnostic{
-		Code:    diagnosticCodeObservationConflict,
-		Message: fmt.Sprintf("observation %s conflicts with a differently-encoded stored row; dropped to avoid blocking ingest", id),
-	}
-	if dropped != nil {
-		diag.AdapterID = dropped.AdapterID
-		diag.RuleID = dropped.RuleID
-		diag.Record = dropped.Record
-	}
-	result.Diagnostics = append(result.Diagnostics, diag)
-
-	return result
+	return "", ""
 }
 
 // sleepBackoff waits for a bounded exponential backoff delay or ctx.Done,

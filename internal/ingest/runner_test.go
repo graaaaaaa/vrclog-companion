@@ -6,6 +6,7 @@ import (
 	"iter"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,21 +23,40 @@ type recordOrErr struct {
 	err    error
 }
 
-// fakeSource yields a fixed sequence then blocks on ctx.Done, simulating a
-// live tail that has caught up.
+// fakeSource yields a fixed sequence then, by default, blocks on ctx.Done —
+// simulating a live tail that has caught up — unless endCleanly is set, in
+// which case it returns immediately after the last item (simulating a
+// source that finishes on its own, e.g. for backoff-reset tests). Every
+// item defaults to DeliveryLive unless phases is set (parallel to items, by
+// index) to override per-item.
 type fakeSource struct {
-	items []recordOrErr
+	items      []recordOrErr
+	phases     []DeliveryPhase // optional; index-aligned with items
+	endCleanly bool
 }
 
-func (s *fakeSource) Records(ctx context.Context) iter.Seq2[vrclog.Record, error] {
-	return func(yield func(vrclog.Record, error) bool) {
-		for _, item := range s.items {
+func (s *fakeSource) Records(ctx context.Context) iter.Seq2[SourceRecord, error] {
+	return func(yield func(SourceRecord, error) bool) {
+		for i, item := range s.items {
 			if ctx.Err() != nil {
 				return
 			}
-			if !yield(item.record, item.err) {
+			phase := DeliveryLive
+			if i < len(s.phases) && s.phases[i] != "" {
+				phase = s.phases[i]
+			}
+			if item.err != nil {
+				if !yield(SourceRecord{}, item.err) {
+					return
+				}
+				continue
+			}
+			if !yield(SourceRecord{Record: item.record, Phase: phase}, nil) {
 				return
 			}
+		}
+		if s.endCleanly {
+			return
 		}
 		<-ctx.Done()
 	}
@@ -364,12 +384,15 @@ func TestRunner_SourceRetryResumesLastCommittedCursor(t *testing.T) {
 	<-done
 }
 
-// TestRunner_ObservationConflictDoesNotBlockIngestForever pins the Round-3
-// adversarial-review fix: a deterministic ErrObservationConflict must not
-// be retried with backoff forever (which would permanently halt ingest).
-// The conflicting Observation is dropped (with a Diagnostic recorded) and
-// the rest of the Record's Observations still commit, advancing the cursor.
-func TestRunner_ObservationConflictDoesNotBlockIngestForever(t *testing.T) {
+// TestRunner_ObservationConflictIsFatal verifies the hardening-spec
+// behavior: a deterministic same-ID-different-content Observation conflict
+// is fatal, not silently dropped-and-retried. Run must return an error
+// wrapping ErrIntegrityViolation, the Runner's State must be StateFailed,
+// no Diagnostic is recorded for it, and — critically — the cursor must not
+// advance, and no other Observation from the same Record (even one with no
+// conflict) may be committed either, since the whole Record's transaction
+// rolled back.
+func TestRunner_ObservationConflictIsFatal(t *testing.T) {
 	rec1 := mkRecord("src1", 0, 1, nil)
 	src := &fakeSource{items: []recordOrErr{{record: rec1}}}
 	factory := &staticFactory{sources: []RecordSource{src}}
@@ -409,37 +432,219 @@ func TestRunner_ObservationConflictDoesNotBlockIngestForever(t *testing.T) {
 
 	r := NewRunner(factory, engine, s, WithDBRetryDelays(1*time.Millisecond, 5*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { r.Run(ctx); close(done) }()
+	defer cancel()
 
-	// If the conflict were retried forever, obs-valid would never commit.
-	waitFor(t, func() bool {
-		items, _, err := s.ListObservations(context.Background(), store.ObservationQuery{})
-		if err != nil {
-			return false
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Run(ctx) }()
+
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s of a fatal conflict")
+	}
+
+	if !errors.Is(runErr, ErrIntegrityViolation) {
+		t.Fatalf("Run() error = %v, want wrapping ErrIntegrityViolation", runErr)
+	}
+
+	var conflictErr *store.ObservationConflictError
+	if !errors.As(runErr, &conflictErr) {
+		t.Fatalf("Run() error = %v, want error chain to contain *store.ObservationConflictError", runErr)
+	}
+
+	if got := r.Status().State; got != StateFailed {
+		t.Fatalf("Status().State = %s, want %s", got, StateFailed)
+	}
+
+	// obs-valid must NOT have committed: the whole Record's transaction
+	// rolled back, it was never dropped-and-retried.
+	items, _, err := s.ListObservations(context.Background(), store.ObservationQuery{})
+	if err != nil {
+		t.Fatalf("ListObservations: %v", err)
+	}
+	for _, it := range items {
+		if string(it.ID) == "obs-valid" {
+			t.Fatal("obs-valid committed despite the conflicting Record's transaction rolling back")
 		}
-		for _, it := range items {
-			if string(it.ID) == "obs-valid" {
-				return true
-			}
-		}
-		return false
-	})
+	}
 
 	diagCount, err := s.CountDiagnostics(context.Background())
 	if err != nil {
 		t.Fatalf("CountDiagnostics: %v", err)
 	}
-	if diagCount == 0 {
-		t.Fatal("expected a diagnostic recording the dropped conflicting observation")
+	if diagCount != 0 {
+		t.Fatalf("CountDiagnostics = %d, want 0 (conflict must not be recorded as a diagnostic)", diagCount)
 	}
 
 	cursor, err := s.LatestCursor(context.Background())
 	if err != nil {
 		t.Fatalf("LatestCursor: %v", err)
 	}
-	if cursor == nil || cursor.Offset != rec1.NextOffset {
-		t.Fatalf("cursor = %+v, want offset %d (must advance past the conflicting record)", cursor, rec1.NextOffset)
+	if cursor == nil || cursor.Offset != seedRec.NextOffset {
+		t.Fatalf("cursor = %+v, want unchanged at seed offset %d (must not advance past a fatal conflict)", cursor, seedRec.NextOffset)
+	}
+}
+
+// TestRunner_OnInsertErrorIsFatal verifies that an OnInsertFunc error
+// (Projector Apply failure on an already-committed Observation) stops the
+// Runner with ErrProjectionFailure, distinct from ErrIntegrityViolation.
+func TestRunner_OnInsertErrorIsFatal(t *testing.T) {
+	rec1 := mkRecord("src1", 0, 1, nil)
+	src := &fakeSource{items: []recordOrErr{{record: rec1}}}
+	factory := &staticFactory{sources: []RecordSource{src}}
+	engine := &fakeEngine{resultFn: func(rec vrclog.Record) vrclog.Result {
+		return playerJoinedResult("Alice")
+	}}
+	st := &fakeStore{}
+
+	onInsertErr := errors.New("simulated projector apply failure")
+	r := NewRunner(factory, engine, st, WithOnInsert(func(_ context.Context, _ DeliveryPhase, _ observation.StoredObservation) error {
+		return onInsertErr
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Run(ctx) }()
+
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return within 2s of a fatal OnInsert error")
+	}
+
+	if !errors.Is(runErr, ErrProjectionFailure) {
+		t.Fatalf("Run() error = %v, want wrapping ErrProjectionFailure", runErr)
+	}
+	if errors.Is(runErr, ErrIntegrityViolation) {
+		t.Fatalf("Run() error = %v, must not also wrap ErrIntegrityViolation (distinct sentinels)", runErr)
+	}
+	if got := r.Status().State; got != StateFailed {
+		t.Fatalf("Status().State = %s, want %s", got, StateFailed)
+	}
+}
+
+// TestRunner_CatchUpPhasePassedToOnInsert verifies that the DeliveryPhase
+// on each SourceRecord reaches OnInsertFunc unchanged, so the caller (main
+// wiring) can suppress SSE/Discord side effects for catch-up Records.
+func TestRunner_CatchUpPhasePassedToOnInsert(t *testing.T) {
+	rec := mkRecord("src1", 0, 1, nil)
+	src := &fakeSource{
+		items:  []recordOrErr{{record: rec}},
+		phases: []DeliveryPhase{DeliveryCatchUp},
+	}
+	factory := &staticFactory{sources: []RecordSource{src}}
+	engine := &fakeEngine{resultFn: func(vrclog.Record) vrclog.Result { return playerJoinedResult("Alice") }}
+	st := &fakeStore{}
+
+	var gotPhase DeliveryPhase
+	phaseCh := make(chan DeliveryPhase, 1)
+	r := NewRunner(factory, engine, st, WithOnInsert(func(_ context.Context, phase DeliveryPhase, _ observation.StoredObservation) error {
+		phaseCh <- phase
+		return nil
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { r.Run(ctx) }()
+
+	select {
+	case gotPhase = <-phaseCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("onInsert not called within 2s")
+	}
+	if gotPhase != DeliveryCatchUp {
+		t.Fatalf("onInsert phase = %s, want %s", gotPhase, DeliveryCatchUp)
+	}
+}
+
+// TestRunner_LivePhaseTriggersOnInsert is the DeliveryLive counterpart to
+// TestRunner_CatchUpPhasePassedToOnInsert.
+func TestRunner_LivePhaseTriggersOnInsert(t *testing.T) {
+	rec := mkRecord("src1", 0, 1, nil)
+	src := &fakeSource{
+		items:  []recordOrErr{{record: rec}},
+		phases: []DeliveryPhase{DeliveryLive},
+	}
+	factory := &staticFactory{sources: []RecordSource{src}}
+	engine := &fakeEngine{resultFn: func(vrclog.Record) vrclog.Result { return playerJoinedResult("Alice") }}
+	st := &fakeStore{}
+
+	phaseCh := make(chan DeliveryPhase, 1)
+	r := NewRunner(factory, engine, st, WithOnInsert(func(_ context.Context, phase DeliveryPhase, _ observation.StoredObservation) error {
+		phaseCh <- phase
+		return nil
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { r.Run(ctx) }()
+
+	select {
+	case gotPhase := <-phaseCh:
+		if gotPhase != DeliveryLive {
+			t.Fatalf("onInsert phase = %s, want %s", gotPhase, DeliveryLive)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("onInsert not called within 2s")
+	}
+}
+
+// TestRunner_BackoffResetsOnProgress verifies that a source run which
+// commits at least one Record resets the outer source-retry backoff, so a
+// subsequent source failure starts from the initial delay rather than
+// continuing to escalate from attempts before the successful run.
+func TestRunner_BackoffResetsOnProgress(t *testing.T) {
+	rec1 := mkRecord("src1", 0, 1, nil)
+
+	var failCount atomic.Int64
+	factory := RecordSourceFactoryFunc(func(_ context.Context, _ *vrclog.Cursor) (RecordSource, error) {
+		n := failCount.Add(1)
+		switch n {
+		case 1, 2, 3:
+			// Three consecutive source-factory failures to build up backoff.
+			return nil, errors.New("simulated source failure")
+		case 4:
+			// Fourth attempt: a source that commits one record then ends
+			// cleanly (returns on its own, rather than blocking on
+			// ctx.Done() like a live tail would) so Run() proceeds to the
+			// next source-factory call without waiting for cancellation.
+			return &fakeSource{items: []recordOrErr{{record: rec1}}, endCleanly: true}, nil
+		default:
+			// Fifth+ attempt: fail again; this should use the RESET
+			// (initial) delay, not continue escalating from attempt 3.
+			return nil, errors.New("simulated source failure after progress")
+		}
+	})
+
+	engine := &fakeEngine{}
+	st := &fakeStore{}
+
+	const initialDelay = 20 * time.Millisecond
+	const maxDelay = 2 * time.Second
+	r := NewRunner(factory, engine, st, WithSourceRetryDelays(initialDelay, maxDelay))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+
+	// Wait until the source that commits a record has run (failCount == 4
+	// consumed) and the subsequent failing attempt (failCount == 5) has
+	// been made.
+	waitFor(t, func() bool { return failCount.Load() >= 5 })
+
+	beforeFifth := time.Now()
+	waitFor(t, func() bool { return failCount.Load() >= 6 })
+	elapsed := time.Since(beforeFifth)
+
+	// If backoff had NOT reset, attempt would be 4 at this point
+	// (escalated from the 3 pre-progress failures), giving a delay of
+	// initialDelay*2^4 = 320ms. With reset, attempt is 0, giving
+	// initialDelay*2^0 = 20ms. Assert well under the un-reset delay.
+	unresetDelay := backoffDelay(initialDelay, maxDelay, 4)
+	if elapsed >= unresetDelay {
+		t.Fatalf("elapsed = %v between post-progress failures, want well under the un-reset delay %v (backoff did not reset after progress)", elapsed, unresetDelay)
 	}
 
 	cancel()

@@ -16,9 +16,14 @@ type Change interface {
 }
 
 // WorldChanged is emitted exactly once per definitive world/instance
-// transition. At is the triggering Observation's OccurredAt.
+// transition. At is the triggering Observation's OccurredAt. Current is a
+// value, not a pointer into Manager's internal state — callers may freely
+// hold or copy it without risk of a later Apply mutating it out from under
+// them. Previous stays a pointer only to represent "no previous world"
+// (nil) versus a real one; when non-nil it is a deep copy, never a shared
+// pointer to internal state.
 type WorldChanged struct {
-	Current  *CurrentWorld
+	Current  CurrentWorld
 	Previous *CurrentWorld
 	At       time.Time
 }
@@ -26,9 +31,10 @@ type WorldChanged struct {
 func (WorldChanged) changeMarker() {}
 
 // WorldNameUpdated is emitted when a pending "entering" name is merged into
-// the current world without constituting a new transition.
+// the current world without constituting a new transition. Current is a
+// value copy, per the same immutability contract as WorldChanged.Current.
 type WorldNameUpdated struct {
-	Current *CurrentWorld
+	Current CurrentWorld
 	At      time.Time
 }
 
@@ -54,9 +60,12 @@ type PlayerLeft struct {
 func (PlayerLeft) changeMarker() {}
 
 // MediaAttemptUpdated is emitted whenever a MediaAttempt is created or
-// modified by a new resource/error Observation.
+// modified by a new resource/error Observation. Attempt is a deep copy
+// (via cloneMediaAttempt) of the internal MediaAttempt at emission time,
+// never a pointer into Manager's internal state — mutating it, or its
+// slices, cannot corrupt what RecentMedia/Snapshot return later.
 type MediaAttemptUpdated struct {
-	Attempt *MediaAttempt
+	Attempt MediaAttempt
 	At      time.Time
 }
 

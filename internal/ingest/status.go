@@ -18,6 +18,10 @@ const (
 	StateRunning  State = "running"
 	StateRetrying State = "retrying"
 	StateStopped  State = "stopped"
+	// StateFailed marks a fatal, unrecoverable ingest error (an integrity
+	// violation or a post-commit projection failure). The Runner does not
+	// retry from this state; the process is expected to exit.
+	StateFailed State = "failed"
 )
 
 // Status is a point-in-time snapshot of ingest health. It contains no
@@ -68,6 +72,16 @@ func (t *statusTracker) recordError(err error) {
 	t.status.RetryCount++
 }
 
+// setFailed transitions to StateFailed for a fatal, non-retryable error.
+// Unlike recordError, RetryCount is not incremented — this is not a retry
+// attempt, it is a terminal state the Runner does not recover from.
+func (t *statusTracker) setFailed(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.status.State = StateFailed
+	t.status.LastError = publicErrorMessage(err)
+}
+
 // maxStatusErrorLen bounds the redacted message so a pathological error
 // chain cannot grow the in-memory/health-exposed string unbounded.
 const maxStatusErrorLen = 512
@@ -112,6 +126,10 @@ func publicErrorMessage(err error) string {
 		return "no log directory available"
 	case errors.Is(err, vrclog.ErrCursorSourceMissing):
 		return "cursor source file not found"
+	case errors.Is(err, ErrIntegrityViolation):
+		return "integrity violation"
+	case errors.Is(err, ErrProjectionFailure):
+		return "projection failure"
 	}
 
 	return truncateUTF8(redactPaths(err.Error()), maxStatusErrorLen)

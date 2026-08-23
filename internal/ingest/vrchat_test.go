@@ -58,7 +58,7 @@ func TestVRChatSource_CursorMissingFallbackRunsOnce(t *testing.T) {
 		t.Fatalf("NewSource: %v", err)
 	}
 
-	var got []vrclog.Record
+	var got []SourceRecord
 	for rec, recErr := range source.Records(ctx) {
 		if recErr != nil {
 			t.Fatalf("unexpected error from fallback read: %v", recErr)
@@ -91,7 +91,7 @@ func TestVRChatSource_NoCursorReadsLatestFile(t *testing.T) {
 		t.Fatalf("NewSource: %v", err)
 	}
 
-	var got []vrclog.Record
+	var got []SourceRecord
 	for rec, recErr := range source.Records(ctx) {
 		if recErr != nil {
 			t.Fatalf("unexpected error: %v", recErr)
@@ -101,6 +101,80 @@ func TestVRChatSource_NoCursorReadsLatestFile(t *testing.T) {
 
 	if len(got) != 2 {
 		t.Fatalf("got %d records, want 2", len(got))
+	}
+}
+
+// TestVRChatSource_CatchUpPhase verifies the catch-up/live delivery-phase
+// split (hardening spec §6.3): bytes that existed on disk when NewSource
+// captured its LogSnapshot are DeliveryCatchUp, and bytes appended after
+// that capture are DeliveryLive.
+func TestVRChatSource_CatchUpPhase(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "output_log_2024-01-01_08-00-00.txt")
+	if err := os.WriteFile(logPath, []byte("2024.01.01 08:00:00 Log        -  pre-existing line\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	factory := NewVRChatSourceFactory(VRChatSourceConfig{LogDir: dir, PollInterval: 100 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// NewSource captures its LogSnapshot here, before the pre-existing line
+	// is consumed and before the new line below is appended.
+	source, err := factory.NewSource(ctx, nil)
+	if err != nil {
+		t.Fatalf("NewSource: %v", err)
+	}
+
+	recCh := make(chan SourceRecord, 8)
+	errCh := make(chan error, 1)
+	go func() {
+		for rec, recErr := range source.Records(ctx) {
+			if recErr != nil {
+				select {
+				case errCh <- recErr:
+				default:
+				}
+				return
+			}
+			recCh <- rec
+		}
+	}()
+
+	select {
+	case rec := <-recCh:
+		if rec.Phase != DeliveryCatchUp {
+			t.Fatalf("pre-existing record Phase = %s, want %s", rec.Phase, DeliveryCatchUp)
+		}
+	case err := <-errCh:
+		t.Fatalf("unexpected error waiting for catch-up record: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the pre-existing (catch-up) record")
+	}
+
+	// Give Follow's poll loop a moment to settle onto the pre-existing
+	// content before appending, so the new bytes land as a distinct,
+	// separately-polled write.
+	time.Sleep(150 * time.Millisecond)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f.WriteString("2024.01.01 08:00:01 Log        -  appended after snapshot\n"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	f.Close()
+
+	select {
+	case rec := <-recCh:
+		if rec.Phase != DeliveryLive {
+			t.Fatalf("appended record Phase = %s, want %s", rec.Phase, DeliveryLive)
+		}
+	case err := <-errCh:
+		t.Fatalf("unexpected error waiting for live record: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the appended (live) record")
 	}
 }
 
@@ -126,7 +200,7 @@ func TestVRChatSource_RotationIsFollowedAcrossFiles(t *testing.T) {
 		t.Fatalf("NewSource: %v", err)
 	}
 
-	recCh := make(chan vrclog.Record, 8)
+	recCh := make(chan SourceRecord, 8)
 	errCh := make(chan error, 1)
 	go func() {
 		for rec, recErr := range source.Records(ctx) {
@@ -142,7 +216,7 @@ func TestVRChatSource_RotationIsFollowedAcrossFiles(t *testing.T) {
 	}()
 
 	first1 := <-recCh
-	if first1.SourceID == "" || string(first1.Message) == "" {
+	if first1.Record.SourceID == "" || string(first1.Record.Message) == "" {
 		t.Fatalf("unexpected first record: %+v", first1)
 	}
 
@@ -156,8 +230,8 @@ func TestVRChatSource_RotationIsFollowedAcrossFiles(t *testing.T) {
 
 	select {
 	case rec := <-recCh:
-		if rec.SourceID == first1.SourceID {
-			t.Fatalf("expected rotated record to carry a new SourceID, got the same one: %s", rec.SourceID)
+		if rec.Record.SourceID == first1.Record.SourceID {
+			t.Fatalf("expected rotated record to carry a new SourceID, got the same one: %s", rec.Record.SourceID)
 		}
 	case err := <-errCh:
 		t.Fatalf("unexpected error while waiting for rotated record: %v", err)

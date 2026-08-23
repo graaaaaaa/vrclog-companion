@@ -47,7 +47,7 @@ type mediaAttemptDTO struct {
 	WorldInstanceID string             `json:"world_instance_id,omitempty"`
 }
 
-func toMediaAttemptDTO(a *projector.MediaAttempt) mediaAttemptDTO {
+func toMediaAttemptDTO(a projector.MediaAttempt) mediaAttemptDTO {
 	resources := make([]mediaResourceDTO, len(a.Resources))
 	for i, r := range a.Resources {
 		resources[i] = mediaResourceDTO{
