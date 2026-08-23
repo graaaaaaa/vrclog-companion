@@ -9,7 +9,7 @@ This release replaces the entire event/storage/API architecture. **There is no c
 - **Module path**: `github.com/graaaaa/vrclog-companion` → `github.com/vrclog/vrclog-companion`. Entry point moved from `cmd/vrclog/` to `cmd/vrclog-companion/`.
 - **Dependency contracts**: now built on the rewritten `vrclog-go` (sealed `Event` interface with 7 kinds, `Record`/`Cursor`/`Observation`, `Engine`, iterator-based `Follow`/`ReadFile`) and the new `vrclog-adapters` module (community `Adapter`s: YamaPlayer, iwaSync3).
 - **Storage model**: the old flat `Event` model (`player_join`/`player_left`/`world_join` only, raw-line SHA-256 dedupe) is gone. Persistence is now a canonical `Observation` stream, deduplicated solely by `vrclog.ObservationID`.
-- **SQLite schema**: new schema version 2 (`observations`, `ingest_cursors`, `diagnostics`), versioned via `PRAGMA user_version`. The old `events`, `ingest_cursor`, `parse_failures`, `meta_json` tables are gone with **no automatic migration**.
+- **SQLite schema**: new schema version 3 (`observations`, `ingest_cursors`, `diagnostics`), versioned via `PRAGMA user_version`. The old `events`, `ingest_cursor`, `parse_failures`, `meta_json` tables are gone with **no automatic migration**; version 2 (an earlier Observation ID identity contract, superseded during this same unreleased cycle) is also rejected.
 - **Ingest**: the channel-based `EventSource`/`Ingester` pipeline and time-based replay (`CalculateReplaySince`) are replaced by an iterator-based `RecordSource` + `Runner` with per-Record atomic transactions and cursor-only resume.
 - **Derived state**: `internal/derive.State` (single switch) is replaced by `internal/projector` — a `Manager` composing `WorldProjector`, `PresenceProjector`, and the new `MediaProjector`, all rebuildable from the database at startup.
 - **API**: `/api/v1/events` and `/api/v1/now` are removed. New endpoints: `GET /api/v1/observations`, `GET /api/v1/state`, `GET /api/v1/media/recent`, `GET /api/v1/adapters`. `/api/v1/stats/basic` and `/api/v1/config` keep their paths with updated response shapes.
@@ -32,3 +32,18 @@ This release replaces the entire event/storage/API architecture. **There is no c
 - Old SQLite tables: `events`, `ingest_cursor`, `parse_failures`, `meta_json`
 - `/api/v1/events`, `/api/v1/now`
 - `internal/api.Hub` (replaced by `internal/sse.Broadcaster`)
+
+### Hardening pass (data integrity, catch-up/live, media correlation)
+
+Follow-up within this same unreleased cycle, tracked in `CLAUDE_HARDENING_SPEC.md`.
+
+- **Observation conflict is now fatal**, not dropped-and-retried: `ingest.Runner` returns an error wrapping the new `ErrIntegrityViolation` sentinel, `Status().State` becomes `StateFailed`, and `cmd/vrclog-companion` performs a controlled shutdown with a non-zero exit. A post-commit `Projector.Apply` failure is also fatal, via a distinct `ErrProjectionFailure` sentinel.
+- **`cmd/vrclog-companion/main.go`** restructured to a `run() error` pattern so deferred DB/lock cleanup always runs, replacing scattered `log.Fatalf` calls.
+- **Source retry backoff resets** to the initial delay after any source run that commits at least one Record, instead of continuing to escalate from pre-recovery failures.
+- **Catch-up vs live delivery phase**: every Record is classified `catch_up` or `live` via a `vrclog.LogSnapshot` captured at each source (re)start — never by timestamp. Both phases persist to DB/Projector; only `live` triggers SSE broadcast or Discord notification, preventing a notification burst from backfilled history on startup/reconnect.
+- **Media correlation is now time-bounded everywhere**: `findByExactTarget`/`findByExactURL` require an explicit occurredAt+window, `role=source` events merge only within a narrow 2s duplicate-burst window, and `ResourceResolved` records both `Input` and `Output` as Resources (previously only `Output`, silently dropping `Input` as a `BestOpenableURL` candidate for resolver-only attempts).
+- **Projector state is now immutable across the Manager boundary**: `Change` values, `Snapshot()`, and `RecentMedia()` return deep copies (via a single `cloneMediaAttempt` clone contract) instead of pointers into live internal state.
+- **`internal/adapter.BuildEngine`** now imports community adapters individually (`yamaplayer.New()`, `iwasync3.New()`) instead of a `vrclog-adapters` aggregate `All()`, so a new community adapter can never be pulled in without an explicit diff.
+- **API server** now defaults to not-ready (`SetReady(true)` required before serving non-health routes), and non-SSE routes are bounded by a 15s `http.TimeoutHandler` (the server-global write timeout stays disabled for SSE's long-lived connections).
+- **Schema version bumped to 3** — see schema note above.
+- **CI**: added a dedicated Ubuntu `-race` job; the release workflow now gates the Windows binary build/publish behind a `verify` job (lint, vet, unit, race, integration, E2E) instead of publishing on tag push alone.

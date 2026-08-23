@@ -30,14 +30,24 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("Fatal: %v", err)
+		os.Exit(1)
+	}
+}
+
+// run wires up and drives the whole application, returning a non-nil error
+// for any fatal startup or runtime failure. All shutdown/cleanup happens via
+// defer, so returning an error here still runs deferred DB/lock release —
+// unlike log.Fatalf, which would skip them.
+func run() error {
 	// 1. Single instance check, config/secrets, security setup.
 	release, ok, err := singleinstance.AcquireLock()
 	if err != nil {
-		log.Fatalf("Failed to acquire lock: %v", err)
+		return fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	if !ok {
-		log.Println("Another instance is already running")
-		os.Exit(1)
+		return fmt.Errorf("another instance is already running")
 	}
 	defer release()
 
@@ -50,17 +60,17 @@ func main() {
 
 	updated, generatedPw, err := config.EnsureLanAuth(&secrets, cfg.LanEnabled)
 	if err != nil {
-		log.Fatalf("Failed to ensure LAN auth: %v", err)
+		return fmt.Errorf("failed to ensure LAN auth: %w", err)
 	}
 	sseUpdated, err := config.EnsureSSESecret(&secrets)
 	if err != nil {
-		log.Fatalf("Failed to ensure SSE secret: %v", err)
+		return fmt.Errorf("failed to ensure SSE secret: %w", err)
 	}
 	updated = updated || sseUpdated
 
 	if updated && secretsStatus != config.SecretsFallback {
 		if err := config.SaveSecrets(secrets); err != nil {
-			log.Fatalf("Failed to save secrets: %v", err)
+			return fmt.Errorf("failed to save secrets: %w", err)
 		}
 		if generatedPw != "" {
 			pwPath, err := config.WritePasswordFile(secrets.BasicAuthUsername, generatedPw)
@@ -88,12 +98,12 @@ func main() {
 	// 2. Store open + schema validation.
 	dataDir, err := config.EnsureDataDir()
 	if err != nil {
-		log.Fatalf("Failed to ensure data directory: %v", err)
+		return fmt.Errorf("failed to ensure data directory: %w", err)
 	}
 	dbPath := filepath.Join(dataDir, appinfo.DatabaseFileName)
 	db, err := store.Open(dbPath)
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		return fmt.Errorf("failed to open database: %w", err)
 	}
 	defer db.Close()
 
@@ -106,7 +116,7 @@ func main() {
 	// 3. Adapter/Engine construction.
 	engine, loadedAdapters, err := adapter.BuildEngine()
 	if err != nil {
-		log.Fatalf("Failed to build adapter engine: %v", err)
+		return fmt.Errorf("failed to build adapter engine: %w", err)
 	}
 	log.Printf("Loaded %d adapters", len(loadedAdapters))
 
@@ -132,18 +142,25 @@ func main() {
 		log.Println("Discord webhook not configured, notifications disabled")
 	}
 
-	onInsert := func(_ context.Context, obs observation.StoredObservation) {
+	// onInsert applies every committed Observation to the Projector
+	// regardless of delivery phase, so DB/Projector state always reflects
+	// catch-up (backfilled) Records. Only DeliveryLive Records fan out to
+	// SSE/Discord — catch-up Records must never surface as "new" activity.
+	// A non-nil return here is fatal: see ingest.OnInsertFunc.
+	onInsert := func(_ context.Context, phase ingest.DeliveryPhase, obs observation.StoredObservation) error {
 		changes, err := manager.Apply(obs)
 		if err != nil {
-			log.Printf("Warning: projector apply failed for observation %s: %v", obs.ID, err)
-			return
+			return err
 		}
-		broadcaster.Broadcast(obs)
-		if notifier != nil {
-			for _, c := range changes {
-				notifier.Enqueue(c)
+		if phase == ingest.DeliveryLive {
+			broadcaster.Broadcast(obs)
+			if notifier != nil {
+				for _, c := range changes {
+					notifier.Enqueue(c)
+				}
 			}
 		}
+		return nil
 	}
 
 	var sourceOpts ingest.VRChatSourceConfig
@@ -219,21 +236,31 @@ func main() {
 
 	// 5. Start the HTTP server before the Projector rebuild completes.
 	// /api/v1/health is always served; every other route 503s until
-	// SetReady(true) below.
+	// SetReady(true) below. NewServer already defaults to not-ready; this
+	// call is defense in depth against that default ever changing.
 	server.SetReady(false)
 
-	errCh := make(chan error, 1)
+	// Capacity 2: both the HTTP server and the ingest Runner goroutines
+	// below can send a fatal error here. A non-blocking send (both
+	// goroutines use select/default) means a second near-simultaneous
+	// fatal error is logged rather than blocking its sender indefinitely,
+	// but sizing for both expected senders avoids relying on that alone.
+	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("Starting VRClog Companion v%s on %s", version.String(), addr)
 		if err := server.Start(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+			select {
+			case errCh <- fmt.Errorf("server error: %w", err):
+			default:
+				log.Printf("server error after another fatal error already reported: %v", err)
+			}
 		}
 	}()
 
 	// 6. Startup Projector rebuild: replay all persisted Observations in
 	// sequence order. No SSE, no Discord notifications during this pass.
 	if err := manager.Rebuild(ctx, db.AllObservations(ctx)); err != nil {
-		log.Fatalf("Projector rebuild failed: %v", err)
+		return fmt.Errorf("projector rebuild failed: %w", err)
 	}
 	log.Println("Projector state rebuilt from database")
 
@@ -241,28 +268,49 @@ func main() {
 	server.SetReady(true)
 
 	// 8/9. Ingest supervisor: internally resolves the latest persisted
-	// cursor and starts consuming Records.
+	// cursor and starts consuming Records. A fatal Runner error (integrity
+	// violation or post-commit projection failure) is routed to errCh so it
+	// triggers the same controlled shutdown as a server error, instead of
+	// being logged and left running in a StateFailed no-op loop. runnerDone
+	// is closed when Run returns for any reason, so shutdown can actually
+	// wait for it below instead of just assuming it has finished.
+	runnerDone := make(chan struct{})
 	go func() {
+		defer close(runnerDone)
 		if err := runner.Run(ctx); err != nil {
-			log.Printf("Ingest runner error: %v", err)
+			select {
+			case errCh <- fmt.Errorf("ingest runner error: %w", err):
+			default:
+				log.Printf("ingest runner error after another fatal error already reported: %v", err)
+			}
 		}
 	}()
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
 
+	var runErr error
 	select {
 	case <-done:
 		log.Println("Shutting down...")
-	case err := <-errCh:
-		log.Printf("Server error: %v", err)
-		os.Exit(1)
+	case runErr = <-errCh:
+		log.Printf("%v", runErr)
 	}
 
-	// Shutdown order: ingest -> pending DB transaction (implicit: Runner's
-	// in-flight CommitRecord finishes before Run returns) -> notifier ->
-	// SSE -> HTTP -> DB.
+	// Shutdown order: ingest -> pending DB transaction -> notifier -> SSE
+	// -> HTTP -> DB. cancel() alone does not guarantee the Runner's
+	// in-flight CommitRecord has finished; wait for runnerDone (bounded,
+	// so a Runner that ignores cancellation cannot hang shutdown forever)
+	// before touching notifier/broadcaster/server, which the Runner's
+	// onInsert callback may still call into.
 	cancel()
+
+	const runnerShutdownWait = 5 * time.Second
+	select {
+	case <-runnerDone:
+	case <-time.After(runnerShutdownWait):
+		log.Printf("Warning: ingest runner did not stop within %s; continuing shutdown", runnerShutdownWait)
+	}
 
 	if notifier != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -285,4 +333,9 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+
+	if runErr != nil {
+		return runErr
+	}
+	return nil
 }

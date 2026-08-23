@@ -149,12 +149,13 @@ This is a breaking renewal: the old flat `Event` model, `/api/v1/events`, `/api/
 
 ## Database schema reset
 
-The SQLite schema is versioned via `PRAGMA user_version` (currently version 2). There is **no automatic migration** from any prior schema. If the app refuses to start because of a schema mismatch, stop the app and rename or delete the database file (`vrclog.sqlite` in the app's data directory) to start fresh — history will be lost, but no data corruption can occur.
+The SQLite schema is versioned via `PRAGMA user_version` (currently version 3). There is **no automatic migration** from any prior schema, including version 2 — version 3 reflects a change to the Observation ID identity contract upstream in `vrclog-go` (the emission index was removed from the ID formula), so version 2 rows are not compatible even though the table structure is unchanged. If the app refuses to start because of a schema mismatch, stop the app and rename or delete the database file (`vrclog.sqlite` in the app's data directory) to start fresh — history will be lost, but no data corruption can occur.
 
 ## Testing
 
 ```bash
 go test ./...
+go test -race ./...
 go test -tags=integration ./test/integration/...
 go test -tags=e2e ./test/e2e/...
 ```
@@ -165,6 +166,8 @@ GitHub Actions runs tests automatically on Windows and Linux runners.
 
 - Triggered on `push` / `pull_request`
 - Build verification on Windows
+- A dedicated Ubuntu job runs the full suite under `-race`
+- The release workflow gates the Windows binary build/publish behind a `verify` job (lint, vet, unit, race, integration, E2E) — a tag push alone never publishes an unverified artifact
 
 ## Security & Privacy
 

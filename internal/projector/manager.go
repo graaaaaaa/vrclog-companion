@@ -88,6 +88,11 @@ func (m *Manager) applyLocked(obs observation.StoredObservation) ([]Change, erro
 	}
 
 	var changes []Change
+	// emit is threaded into the media apply methods so they can skip
+	// building (and cloneMediaAttempt-copying) a Change during Rebuild,
+	// where applyLocked discards all Changes anyway — state mutation
+	// still happens unconditionally, only Change construction is skipped.
+	emit := !m.rebuilding
 
 	switch ev := event.(type) {
 	case vrclog.WorldJoiningObserved:
@@ -104,11 +109,11 @@ func (m *Manager) applyLocked(obs observation.StoredObservation) ([]Change, erro
 	case vrclog.PlayerLeft:
 		changes = append(changes, m.presence.applyLeft(ev, obs.OccurredAt)...)
 	case vrclog.ResourceURLObserved:
-		changes = append(changes, m.media.applyResourceURL(ev, obs)...)
+		changes = append(changes, m.media.applyResourceURL(ev, obs, emit)...)
 	case vrclog.ResourceResolved:
-		changes = append(changes, m.media.applyResourceResolved(ev, obs)...)
+		changes = append(changes, m.media.applyResourceResolved(ev, obs, emit)...)
 	case vrclog.MediaErrorObserved:
-		changes = append(changes, m.media.applyMediaError(ev, obs)...)
+		changes = append(changes, m.media.applyMediaError(ev, obs, emit)...)
 	}
 
 	if m.rebuilding {
@@ -138,9 +143,10 @@ func (m *Manager) Snapshot() Snapshot {
 	}
 }
 
-// RecentMedia returns up to limit recent MediaAttempts, newest first. A
-// non-positive limit returns all retained attempts (at most mediaMaxRecent).
-func (m *Manager) RecentMedia(limit int) []*MediaAttempt {
+// RecentMedia returns up to limit recent MediaAttempts (deep copies, safe
+// to mutate), newest first. A non-positive limit returns all retained
+// attempts (at most mediaMaxRecent).
+func (m *Manager) RecentMedia(limit int) []MediaAttempt {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	all := m.media.recentSnapshot()

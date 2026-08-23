@@ -44,7 +44,7 @@ func (w *worldProjector) applyJoining(ev vrclog.WorldJoiningObserved, occurredAt
 	}
 	w.pending = nil
 
-	prev := w.current
+	prevCopy := w.currentCopy()
 	next := &CurrentWorld{
 		ID:         ev.World.ID,
 		Name:       name,
@@ -53,7 +53,7 @@ func (w *worldProjector) applyJoining(ev vrclog.WorldJoiningObserved, occurredAt
 	}
 	w.current = next
 
-	return []Change{WorldChanged{Current: next, Previous: prev, At: occurredAt}}
+	return []Change{WorldChanged{Current: *next, Previous: prevCopy, At: occurredAt}}
 }
 
 // applyEntering handles world.entering_observed. The name is always stored
@@ -75,7 +75,7 @@ func (w *worldProjector) applyEntering(ev vrclog.WorldEnteringObserved, occurred
 	w.current.Name = ev.World.Name
 	w.pending = nil
 
-	return []Change{WorldNameUpdated{Current: w.current, At: occurredAt}}
+	return []Change{WorldNameUpdated{Current: *w.current, At: occurredAt}}
 }
 
 // currentCopy returns a defensive copy of the current world state, or nil.

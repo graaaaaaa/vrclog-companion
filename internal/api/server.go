@@ -58,6 +58,20 @@ type Server struct {
 	// Projector rebuild is in progress: requests get 503 instead of
 	// touching not-yet-consistent state.
 	ready atomic.Bool
+
+	// nonSSEHandlerTimeout overrides nonSSEHandlerTimeout for tests that
+	// need a fast, deterministic timeout instead of waiting out the real
+	// 15s bound. Zero means "use the default."
+	nonSSEHandlerTimeout time.Duration
+}
+
+// withNonSSEHandlerTimeout overrides the non-SSE handler timeout (default
+// nonSSEHandlerTimeout). Test-only: exercising the real 15s bound in a
+// unit test would make it slow and is unnecessary — the mechanism itself
+// (http.TimeoutHandler) is a well-tested stdlib primitive; what needs
+// verifying here is that it is wired to non-SSE routes and never to SSE.
+func withNonSSEHandlerTimeout(d time.Duration) ServerOption {
+	return func(s *Server) { s.nonSSEHandlerTimeout = d }
 }
 
 // SetReady marks the server ready (or not) to serve routes other than
@@ -167,7 +181,7 @@ func NewServer(addr string, health app.HealthUsecase, opts ...ServerOption) *Ser
 		health:         health,
 		sseConnLimiter: newSSEConnLimiter(),
 	}
-	s.ready.Store(true) // callers that manage startup rebuild call SetReady(false) explicitly
+	s.ready.Store(false) // callers that manage startup rebuild call SetReady(true) once it completes
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -203,9 +217,22 @@ func (s *Server) readyMiddleware(h http.Handler) http.Handler {
 	})
 }
 
-// wrapAuth wraps a handler with the readiness gate, rate limiting (if
+// nonSSEHandlerTimeout bounds how long a non-SSE route's handler may run
+// before the client receives a 503 and the handler's own writes become
+// no-ops. The server-global http.Server.WriteTimeout is 0 (required to
+// keep SSE connections alive indefinitely) so, unlike a normal Go server,
+// nothing else bounds a stalled non-SSE handler — this is that bound.
+const nonSSEHandlerTimeout = 15 * time.Second
+
+// wrapAuth wraps a handler with the readiness gate, a full-handler-duration
+// timeout (never applied to SSE — see wrapSSEAuth), rate limiting (if
 // configured), and auth middleware (if enabled).
 func (s *Server) wrapAuth(h http.Handler) http.Handler {
+	timeout := nonSSEHandlerTimeout
+	if s.nonSSEHandlerTimeout > 0 {
+		timeout = s.nonSSEHandlerTimeout
+	}
+	h = http.TimeoutHandler(h, timeout, "request timed out")
 	h = s.readyMiddleware(h)
 	if s.rateLimiter != nil {
 		h = s.rateLimiter.Middleware(h)
@@ -272,11 +299,15 @@ func (s *Server) registerRoutes() {
 		s.mux.Handle("PUT /api/v1/config", s.wrapAuth(http.HandlerFunc(s.handlePutConfig)))
 	}
 
-	// Static file serving (catch-all, must be last)
+	// Static file serving (catch-all, must be last). Wrapped with wrapAuth
+	// like every other non-SSE route so it gets the same readiness gate
+	// and 15s write-deadline bound — index.html/assets 503 during startup
+	// rebuild exactly as every API route does, rather than silently
+	// bypassing that invariant.
 	if s.webFS != nil {
 		spa, err := newSPAHandler(s.webFS)
 		if err == nil {
-			s.mux.Handle("/", spa)
+			s.mux.Handle("/", s.wrapAuth(spa))
 		}
 	}
 }

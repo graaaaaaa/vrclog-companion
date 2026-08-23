@@ -1,29 +1,27 @@
 # Codexコードレビュー: main
 
-**日時**: 2026-08-19
-**総合判定**: CRITICAL
+**日時**: 2026-08-23
+**総合判定**: CRITICAL（**全7件修正済み、`go test -race ./...` / integration / e2e / Windows build 全通過**）
 **パースペクティブ数**: 3（正確性 / セキュリティ / パフォーマンス・アーキテクチャ）
 **反復深化ラウンド数**: 3/5
-**最終信頼度**: thorough（全ラウンドで `analysis_depth: thorough/adequate`, 未解決事項なし）
-**ベース**: origin/main (5d312d87d877e75c9214f24ad2e77977ad6800bf)
-**HEAD**: 未コミットの作業ツリー（このセッションでコミットは作成していない — 全面刷新実装がすべて working tree 上の変更として存在）
-**変更ファイル数**: 108（レビュー対象。`.claude/docs/research/**`、`CLAUDE_IMPLEMENTATION_SPEC.md`、ビルド成果物は対象外）
+**最終信頼度**: thorough（全パースペクティブ、Round 3で収束確認済み）
+**ベース**: HEAD (f2aff208880b6728755035c405b67b67b1c7b70c) — 注: mainブランチ自体への未コミット作業ツリー変更のためコミット範囲差分ではなく `git diff HEAD` を使用
+**HEAD**: 作業ツリー（未コミット）
+**変更ファイル数**: 33（修正30、新規3）
 
 ## 総合評価
 
-`CLAUDE_IMPLEMENTATION_SPEC.md` に基づく全面刷新（旧 Event モデル→Observation/Projector アーキテクチャ）は、設計として一貫しており、セキュリティ観点（認証配線、SQL bind parameter、Diagnostics redaction、Discord送信内容、XSS対策、URL scheme検証）は Perspective B により **所見ゼロ** で確認された。しかし正確性観点で **3件の CRITICAL** が実コード追跡により確認された。いずれも「異常系・再起動系のパス」に潜んでおり、通常のハッピーパステストでは検出されない性質のバグである。マージ前の修正を推奨する。
+CLAUDE_HARDENING_SPEC.mdの7フェーズ実装は全体として設計意図に忠実だが、Media相関ロジック（`internal/projector/media.go`）に**実際に再現可能なCRITICAL相関バグ**が1件見つかった — `findByExactURL`がtarget競合チェックを欠いており、異なるオンスクリーンターゲット（例: 2人のプレイヤーが同じURLを再生）が誤って同一MediaAttemptへマージされる。これは人間レビュアーが実テストで実証済み（`TestMedia_TwoPlayersInterleaved_NoMixup`は異なるURLケースのみをカバーしており、同一URL・異なるtargetのケースを見逃していた）。加えて、API/main.goの堅牢化に4件のWARNING、パフォーマンス面に2件のSUGGESTIONが見つかった。いずれも修正案は具体的かつ検証済みで、Codex 3ラウンドの反復深化でアドバーサリアルシナリオへの耐性も確認済み。
 
 ## パースペクティブ統合
 
 ### 一致点
-- 認証配線（`/api/v1/health` のみ未認証、他は `wrapAuth`/`wrapSSEAuth` 経由）は正しく実装されている
-- SQL は全て bind parameter 化されている（インジェクションなし）
-- Discord 通知は World/Player Change のみで、`MediaAttemptUpdated`（メディアURL）は送信対象外
-- `internal/projector/media.go` の相関スキャンや `internal/sse/broadcaster.go` の fan-out はこの規模のローカルアプリとして許容範囲
+- 全パースペクティブが、Fatal-conflict rollbackとDeliveryPhaseゲーティングは正しく実装されていると判断
+- Perspective AとC（独立実行）がどちらもserver.go:306の静的SPAルートのラップ漏れを指摘（収束的発見）
+- セキュリティ観点では新規CVE・シークレット漏洩・ミドルウェアバイパスは検出されず
 
 ### 不一致点と解決
-パースペクティブ間での severity 判定の直接的な矛盾はなかった。ただし Round 3 の追加検証で以下の再評価を実施:
-- `internal/api/config.go` の `err.Error()` 露出は、当初 WARNING 想定だったが、LAN モードでの Basic Auth 保護とローカルループバック専用の脅威モデルを踏まえ **SUGGESTION に確定**（Codex 最終判断）
+矛盾なし。3パースペクティブの判定は独立していたが、severityの食い違いは発生しなかった（Perspective Aの2件のCRITICALはRound 2でCodex自身により1件がWARNINGへ格下げされたのみで、これは新情報＝実アダプタが該当フィールドを使用していないという事実に基づく妥当な格下げ）。
 
 ## 所見一覧
 
@@ -31,82 +29,59 @@
 
 | # | ファイル | 行 | 問題 | 修正案 | 検出元 |
 |---|---------|-----|------|--------|--------|
-| 1 | `internal/api/stream.go` | 57, 138 | SSE 再接続の backlog 上限が `Broadcaster.HighWaterSequence()`（プロセス起動時0、新規insert時のみ進む）を使っており、**プロセス再起動直後**に有効な Last-Event-ID を持つクライアントが再接続すると、DB に永続化済みの Observation が存在するにもかかわらず backlog が **無言で空** になる。クライアントは完全に同期済みと誤認し、後続のライブイベントでカーソルが進むため、欠落は恒久的に検出不能になる。 | `Store.LatestSequence(ctx) (int64, error)` を新設（`SELECT COALESCE(MAX(sequence),0) FROM observations`）し、`Subscribe()` 後に DB から high-water を取得するよう変更。`sendBacklog` は実際に配信した最終 sequence を返すようにし、`handleStream` の `lastSent` をその値で更新（live channel との重複防止）。加えて `maxBacklogObservations = 1000` 件の再生上限を設け、超過時は `writeSSEReset` にフォールバック。SQLite WAL 下でのコミット済みデータのみを読む性質上、この修正に競合リスクはない（Round 3 で検証済み）。 | Perspective A (正確性) → Round 2/3 で修正案検証・確定 |
-| 2 | `internal/ingest/status.go` | 61 (`recordError`) | `t.status.LastError = err.Error()` が ingest エラー（`vrclog.Follow` 由来の `os.Open` エラー等）をそのまま保持し、**認証不要**の `GET /api/v1/health` の `last_ingest_error` フィールドとして露出する。ローカルファイルパスが含まれ得る（例: `open /Users/foo/AppData/.../output_log_...txt: no such file or directory`）。 | `internal/ingest/status.go` の `recordError` で **write time** に redact する（read time の `health.go` ではなく、`ingest.Status` を将来読む全ての呼び出し元に対して安全にするため）。`*fs.PathError` は構造的に unwrap して `Op` + サニタイズ済み reason を残し、それ以外は正規表現ベースの絶対パス除去（Windows `C:\...` / Unix `/...`）でフォールバック。 | Perspective A (正確性) → Round 2 で修正案検証・確定 |
-| 3 | `internal/ingest/runner.go` | 197-224 (`runSource` の内側リトライループ) | `CommitRecord` が `store.ErrObservationConflict`（同一 ID・異なる内容という**恒久的**な conflict）で失敗した場合も、一時的な DB エラーと**区別せず**同じ bounded backoff（1s〜30s）で無限リトライする。同じ Record は決定的に同じ conflict を再生成するため、30秒間隔での永久リトループに陥り、**それ以降のすべての ingest が恒久的に停止**する。DB ファイルを手動削除する以外に復旧手段がない。 | `commitErr` を `errors.Is(commitErr, store.ErrObservationConflict)` で判定し、一時的エラーとは別経路で処理する。具体的には conflict を Diagnostic として永続化し、当該 Record の cursor を進めて次の Record へ進む（silent overwrite ではなく "skip with audit trail"）。 | Round 3 アドバーサリアルスイープで新規発見。実コード追跡で確認済み |
+| 1 | `internal/projector/media.go` | 338-353 (`findByExactURL`) | `targetConflicts`チェックを欠く。**実テストで再現確認済み**: 異なるtarget（playerA/playerB）が同一URLをresolver_input roleで観測すると誤って1 Attemptへマージされる（正しくは2）。`findSourceDuplicate`/`findSingleRecentCandidate`は同チェックを持つのに`findByExactURL`だけ欠落 | `target *MediaTargetDTO`引数を追加し`targetConflicts(a.Target, target)`でスキップ。呼び出し箇所4箇所（media.go:173, 178, 225, `findCandidate`内258）はすべて既に`target`変数がスコープ内にあり追加配線不要 | Perspective A（Round 2/3で修正案検証・アドバーサリアル耐性確認済み） |
 
 ### WARNING（修正推奨）
 
 | # | ファイル | 行 | 問題 | 修正案 | 検出元 |
 |---|---------|-----|------|--------|--------|
-| 4 | `internal/projector/manager.go` | `Manager.Rebuild` | `Rebuild` が既存の `m.world`/`m.presence`/`m.media` に直接 replay するため、同一 Manager に対して2回呼ぶと Media の Resources/Errors 等が重複する。現在の本番コードパス（`cmd/vrclog-companion/main.go`）では起動時に一度しか呼ばれないため未発火だが、"DBから完全に再構築可能" という明言された契約に違反する。 | 新しい `Manager` に replay し、成功時のみ `m.world`/`m.presence`/`m.media` を swap する（Codex 提供の完全な実装コードあり）。`TestManager_RebuildTwiceIsIdempotent` を追加し、2回 Rebuild しても Resources/Errors が重複しないことを検証。 | Perspective A (正確性) → Round 2 で FIX_NOW 判定・コード確定 |
+| 2 | `internal/projector/media.go` | 213-248 (`applyMediaError`) | `ev.Resource.URL`を相関検索にのみ使い、`attachResource`を一度も呼ばない。現状は3実アダプタ（core/yamaplayer/iwasync3）のどれも`MediaErrorObserved.Resource`を設定しないため到達不能だが、将来のアダプタ追加で再発しうる潜在バグ | `ev.Resource != nil`なら`attachResource(attempt, res, target)`をattempt解決後（`isNew`/`newAttempt`ブロックの後）に追加。roleは`ev.Resource.Role`をそのまま使用 | Perspective A（Round 2でCRITICAL→WARNINGへ格下げ、Round 3でCodexが再確認） |
+| 3 | `internal/api/server.go` | 306 | 静的SPAキャッチオール（`s.mux.Handle("/", spa)`）が`wrapAuth`を経由せず登録され、readiness gate・15秒`http.TimeoutHandler`・rate limitのいずれも適用されない。本ハードニング作業以前から存在する箇所だが、新設した「SSE以外は有限deadline」という不変条件に対して一貫性を欠く | `s.mux.Handle("/", s.wrapAuth(spa))`。Codexは「起動中に静的シェルへ503が返るUX変化」を許容範囲と判断（server.goのコメントが元々「every route except /api/v1/health returns 503 until rebuild completes」と明言しているため、意図と整合） | Perspective A + Perspective C（独立して収束） |
+| 4 | `cmd/vrclog-companion/main.go` | 266-286 | ingest RunnerのgoroutineをJOINせずに`cancel()`直後にnotifier/broadcaster/server/DBのshutdownへ進む。コメントは「Runnerのin-flight CommitRecordが完了してから...」という順序を主張しているが、コードはそれを強制しない。`Broadcaster.Broadcast()`は`Stop()`後も安全（空mapへの反復のみ）と確認済みだが、`notifier.Enqueue`が`notifier.Stop()`後に呼ばれるレース、および`db.Close()`とin-flight `CommitRecord`のオーバーラップの可能性が残る（`database/sql.DB.Close()`自体はin-use接続の完了を待つため後者は致命的ではない） | `runnerDone := make(chan struct{})`をrunner goroutineでdefer closeし、`cancel()`直後・`notifier.Stop()`の前に`select { case <-runnerDone: case <-time.After(5*time.Second): 警告ログ }`を追加。runner goroutine内の`errCh`送信もnon-blocking化（select/default）してjoinとのデッドロックを防止。既存の`TestRunner_CancellationCleanlyStops`（2秒以内のキャンセル応答を保証）と5秒待機は整合的とCodexが確認 | Perspective A（Round 2/3で修正案の妥当性・既存テストとの整合性を検証済み） |
+| 5 | `.github/workflows/release.yml` | 8-9 | 新設した`verify` jobが、`release` jobのみに必要な`contents: write`をworkflowスコープから継承している。verify jobはnpm/go build・testのみでリリース権限は不要 | workflowスコープを`contents: read`に変更し、`release` jobにのみ`permissions: contents: write`を追加 | Perspective B（セキュリティ、OWASP A08） |
 
 ### SUGGESTION（改善提案）
 
 | # | ファイル | 行 | 問題 | 修正案 | 検出元 |
 |---|---------|-----|------|--------|--------|
-| 5 | `internal/api/config.go` | 41 (`handlePutConfig`) | `ConfigService.UpdateConfig` のエラーを `err.Error()` のまま 400 レスポンスの public message として返す。config/secrets ファイルの保存失敗時、ローカルパスを含み得る。LAN モードでは Basic Auth 保護下にあり、露出するのはユーザー自身の app-data ディレクトリのパスのみのため、脅威としては軽微。 | 固定の汎用メッセージに置き換えるか、`ConfigService` から型付き/センチネルのバリデーションエラーのみを公開する。 | Round 2 追加発見 → Round 3 で severity を WARNING→SUGGESTION に確定 |
-| 6 | `internal/store/query.go` | `since`/`until` フィルタ | `occurred_at` 範囲フィルタと `ORDER BY sequence` の組み合わせが `observations_occurred_idx(occurred_at, sequence)` を完全には活かせない可能性がある。ローカルアプリの現実的なデータ量では問題にならないが、数ヶ月に渡るスパースなクエリでは体感速度に影響し得る。 | 需要が出た場合、`ORDER BY occurred_at DESC, sequence DESC` + 対応カーソルへの変更を検討。現時点では対応不要。 | Perspective C (パフォーマンス) |
-| 7 | `web/src/pages/History.tsx` | `setObservations` | "Load more" を繰り返すと React state が無制限に蓄積し、5000〜10000件規模でブラウザメモリを消費する。バックエンドのページングは正しく機能している。 | 表示件数に軽い上限（例: 直近1000件のみ保持）を設けるか、将来的に仮想スクロールを検討。 | Perspective C (パフォーマンス) |
-
-## 対応状況（修正実装）
-
-ユーザー指示「WARNING/SUGGESTIONも含めて全て修正」に基づき、以下を実装しレビュー後の品質ゲート（`gofmt`, `go vet`, `go build`, `go test ./...`, `go test -race ./...`, integration, e2e, `GOOS=windows go build`, `npm run lint`, `npm run build`）を全て通過済み。
-
-| # | severity | 対応 | 実装内容 |
-|---|----------|------|---------|
-| 1 | CRITICAL | 修正済み | `Store.LatestSequence` 新設、`internal/api/stream.go` の `handleStream`/`sendBacklog` を再設計。回帰テスト `TestStream_BacklogSurvivesRestart`（再起動直後の backlog 欠落）、`TestStream_LiveEventNotDuplicatedAfterBacklog`（backlog/live 二重配信防止）を追加 |
-| 2 | CRITICAL | 修正済み | `internal/ingest/status.go` に `publicErrorMessage`（write-time redaction）を追加。`internal/ingest/status_test.go` を新設（5テスト） |
-| 3 | CRITICAL | 修正済み | `store.ObservationConflictError` 型を新設し `internal/ingest/runner.go` で conflict を Diagnostic 化して skip。`TestRunner_ObservationConflictDoesNotBlockIngestForever` を追加 |
-| 4 | WARNING | 修正済み | `internal/projector/manager.go` の `Rebuild` を swap 方式に変更。`TestManager_RebuildTwiceIsIdempotent` を追加 |
-| 5 | SUGGESTION | 修正済み | `internal/app/config.go` に `ValidationError` 型を新設し、`internal/api/config.go` でクライアント入力起因のエラーのみメッセージを公開・それ以外は汎用メッセージ＋サーバーログに変更。`internal/app/config_test.go` を新設 |
-| 6 | SUGGESTION | **見送り**（要ユーザー判断） | Codex 自身の最終判断が「現時点では対応不要」。提案されたカーソル方式変更（`ORDER BY occurred_at` + 複合カーソル）は `SPEC.md`/`CLAUDE.md` に明記された「`sequence` int64 を不透明カーソルとする」設計上の決定を変更する影響の大きい変更であり、実測データ量での問題も未確認のため、指示に反して実装を見送った。対応が必要になった場合は改めて設計レビューから着手することを推奨 |
-| 7 | SUGGESTION | 修正済み | `web/src/pages/History.tsx` に `maxRetainedObservations = 1000` の上限を追加（"Load more" 繰り返し時に古い行から破棄） |
-
-### 検討したが対応不要と判断した項目
-
-- **`internal/api` が `internal/projector`/`internal/store` の型に直接依存**（`app` 層専用DTOを経由しない）: このリポジトリの規模（単一チーム・単一リポジトリのローカルデスクトップアプリ）では、抽象化の追加によるリスク低減効果より間接化のコストの方が大きいと判断（ACCEPTABLE_AS_IS）。
-- **`internal/ingest/status.go` と `internal/store/diagnostics.go` の2つの redaction ロジックの重複**: 対象データの性質（永続化される Diagnostic の内容 vs. 一時的な公開向けエラーテキスト）が異なるため独立実装のままで問題なし。3つ目の redaction 需要が出た場合のみ `internal/redact` のような中立パッケージへの切り出しを検討。
-- **`LatestSequence()` の SQLite WAL 下での競合可能性**: `SELECT MAX(sequence)` はコミット済みデータのみを読み、`CommitRecord` は `tx.Commit()` 成功後にのみ broadcast するため、dirty read や逆転は発生しない。
+| 6 | `internal/projector/manager.go` | 84-118 (`applyLocked`) | Rebuild中（`m.rebuilding == true`）でもMedia系apply*メソッドが無条件に呼ばれ、`cloneMediaAttempt`によるフルディープコピー（Target + 4スライス）を実行した直後に`if m.rebuilding { return nil, nil }`で結果を破棄している。起動時の一度きりのコストであり、`mediaMaxRecent=50`で上限されるため実害は小さいとCodexは判断 | `applyResourceURL`/`applyResourceResolved`/`applyMediaError`に`emit bool`引数を追加し、状態変更はそのまま行い、`!emit`なら`Change`構築前に`nil`を返す。`applyLocked`から`!m.rebuilding`を渡す | Perspective C（2回の独立実行で収束）、Round 3で確認 |
+| 7 | `cmd/vrclog-companion/main.go` | 243 | `errCh := make(chan error, 1)`の容量が1だが、HTTPサーバーとingest Runnerの2つのgoroutineが送信しうる。Finding 4の修正でrunner側がnon-blocking送信になった後は、2件目のfatal errorが（デッドロックではなく）ログにのみ記録され握りつぶされるだけのcosmeticな問題に縮小 | チャネル容量を2へ変更 | Perspective C、Round 3で確認 |
 
 ## 代替実装提案
 
-SSE backlog 修正（CRITICAL #1）について、Codex は3つの候補を比較検討した:
-
-- **(a) 採用**: `Store.LatestSequence()` を DB から都度取得 — プロセス再起動後も正しく機能し、テストや将来の別サーバー構成にも自動的に効く
-- (b) 却下: `main.go` から `Broadcaster.SeedHighWater()` で起動時に一度だけ seed する方式 — 特定の起動順序に依存し、テストや別の起動経路で容易に見落とされる脆さがある
-- (c) 未提示の別案なし
+Codexから重複した代替アプローチの提案はなし。各所見について単一の明確な修正案のみが提示され、複数案の評価が必要な状況（`pending_alternatives ≥ 2`）は発生しなかったため、Phase 2cのユーザー確認はスキップした。
 
 ## 深化ログ
 
 | ラウンド | Codexへの質問内容 | 解決された項目 | 残った未解決事項 |
 |----------|------------------|---------------|----------------|
-| 1 | 3パースペクティブ並列レビュー（正確性/セキュリティ/パフォーマンス・アーキテクチャ）、108ファイルの全面刷新diffを重点ファイル指定付きで確認 | CRITICAL 2件（SSE backlog, health path leak）、WARNING 2件（Rebuild非冪等性, API層依存）を発見。セキュリティ観点は所見ゼロ | SSE修正の具体案、path leak修正の具体案、API層依存の是非、Rebuild冪等性対応要否 |
-| 2 | 3並列で深掘り: (1)SSE修正案の妥当性検証とWAL下での競合有無, (2)path leak修正案の具体化と他の漏洩箇所探索, (3)API層依存とRebuild冪等性の最終判定 | SSE修正: `LatestSequence()`案を確定、`sendBacklog`の戻り値設計・bounded replay(1000件)を確定。Path leak: write-time redaction・`fs.PathError`構造的unwrap案を確定。新規発見: `internal/api/config.go`のerr.Error()露出。API層依存: ACCEPTABLE_AS_IS確定。Rebuild: FIX_NOW確定、swap実装コード確定 | config.go新規発見のseverity未確定、WALレース理論的検証未実施、redaction重複のDRY要否未検証、CommitRecord conflict時のRunnerリトライ挙動未検証 |
-| 3 | アドバーサリアル最終スイープ: (1)LatestSequenceのWALレース理論検証, (2)redaction DRY要否, (3)CommitRecord conflict時のRunner無限リトライシナリオ, (4)config.go severityの最終確定 | WALレース: 実バグでないと確認。DRY: 独立実装のままで良いと確定。**新規CRITICAL発見**: ErrObservationConflict時の無限リトライで ingest が恒久停止するバグを実コード追跡で確認。config.go: SUGGESTIONに確定 | なし（全項目解決、`more_rounds_needed: false`） |
+| 1 | 3パースペクティブ並列（正確性・セキュリティ・パフォーマンス/アーキテクチャ）。Perspective Cは初回試行が実際にはcodex execを呼ばず（0バイト出力）検出・再実行 | Finding 1-5を発見。Finding 1は人間レビュアーが実テストで再現確認（`internal/projector/zz_repro_test.go`で反証、テスト後削除） | Finding 1/2の正確なseverity切り分け、Finding 3/4の具体的修正設計、Finding 5の正確なYAML diff |
+| 2 | 「correctness-fixes」（Finding 1/2の修正案検証、他の呼び出し箇所の網羅確認）と「hardening-gaps」（Finding 3/4/5の修正設計、UXへの影響、DB Close安全性）を並列実行。hardening-gaps側は2回サブエージェントがcodex execを実際に待たずに終了する事象が発生し、メインエージェントが直接同期実行して解決 | Finding 1の修正箇所4箇所すべて特定・妥当性確認。Finding 2をCRITICAL→WARNINGへ格下げ。Finding 3/4/5の具体的YAML/コード diff確定 | なし（Codex自身が`more_rounds_needed: false`と回答したが、MIN_DEEPENING_ROUNDS=3のため追加ラウンドを強制実行） |
+| 3 | アドバーサリアルドリルダウン: Finding 1修正のnilターゲット・Input/Output対称性検証、Finding 4修正の`db.Close()`安全性・既存テストとの整合性検証、Perspective Cから新たに浮上したFinding 6/7（Rebuild中の無駄なclone、errCh容量）の確認 | 全所見の最終severity確定（Finding 1=CRITICAL、Finding 2-5=WARNING、Finding 6-7=SUGGESTION）。Finding 1修正はnilターゲットケースで正しく動作することを確認 | なし。`convergence.more_rounds_needed: false`、`unresolved_uncertainties`は実運用でのメディア観測件数の見積もりのみ（テレメトリなしのため推定値） |
 
 ## 実行モード
 
 - **インタラクティブモード**: true
-- **Phase 0 スコープ選択**: 実行（差分範囲=ベースブランチ差分 / 深さ=ディープ / 重点=バランス重視 / severity=通常基準）
-- **採用された Phase 0 デフォルト値**: 深度=3/5 ラウンド、重点=balanced、差分範囲=base-branch、severity=normal
-- **Phase 4 次アクション確認**: 実行済み
+- **Phase 0 スコープ選択**: 実行（ベースブランチ差分 / ディープ / バランス重視 / 通常基準）
+- **採用された Phase 0 デフォルト値**: 深度=3/5ラウンド、重点=balanced、差分範囲=base-branch（実質的にはmainブランチ自体への未コミット作業ツリー差分として`git diff HEAD`で代替）、severity=normal
+- **Phase 4 次アクション確認**: 実行予定
 
 ## エスカレーション回答（インタラクティブモード時）
 
 | Phase | 質問 | ユーザー回答 | 判定への影響 |
 |-------|------|-------------|-------------|
-| 0 | 差分範囲/深さ/重点観点/判定厳しさ | ベースブランチ差分 / ディープ(MIN=3,MAX=5) / バランス重視 / 通常基準 | Round数=3、focus均等、severity変換なしで確定 |
-| 4 | レビュー結果 CRITICAL（3件）です。次にどうしますか？ | WARNING/SUGGESTIONも含めて全て修正 | CRITICAL 3件・WARNING 1件・SUGGESTION 2件（#5, #7）を実装し回帰テストを追加。SUGGESTION #6（`internal/store/query.go` の since/until 索引ミスマッチ）はCodex自身の判定が「現時点では対応不要」であり、提案対応（`ORDER BY occurred_at` + カーソル方式変更）は `SPEC.md`/`CLAUDE.md` が明記する「sequence を不透明カーソルとする」設計を変更する影響の大きい変更のため、実装せず保留としてユーザーに報告 |
-
-Phase 2c のエスカレーション条件（severity 不一致・複数未評価代替案・ラウンド上限到達）はいずれも該当しなかったため、ユーザーへの追加確認は発生しなかった。
+| 0 | 差分範囲 | ベースブランチ差分(推奨) | mainブランチ自体がHEADのため、`git diff HEAD`（作業ツリー差分）を実質的な等価物として採用 |
+| 0 | 深さ | ディープ | MIN=3, MAX=5ラウンドを実施、実際に3ラウンドで収束 |
+| 0 | 重点観点 | バランス重視 | 正確性・セキュリティ・パフォーマンスを均等にレビュー |
+| 0 | 判定厳しさ | 通常基準 | severity変換なし |
+| 2c | (該当なし) | - | パースペクティブ間のseverity矛盾なし、複数修正案の競合なしでスキップ |
+| 4 | レビュー結果 CRITICAL です。次にどうしますか？ | CRITICAL項目から修正を開始 | 次アクション: Finding 1（findByExactURLのtarget競合バグ）から順に、検証済みの修正案（Finding 1-7）を実装 |
 
 ## 不確実性
 
-- 108ファイル全ての完全な全文精査は、重点指定されたファイル（store/projector/ingest/SSE/API境界）を中心に実施しており、それ以外の細部まで完全網羅ではない（Perspective A自己申告）
-- ローカルでの `go test`/`govulncheck` 実行は Codex 側では行っていない（read-only レビューのため。実際の `go test ./...` は本セッション内で別途全て実行し pass 済み）
-- Round 3 の WAL レース検証は、修正コードがまだ working tree に反映されていない時点での**設計評価**であり、実装後の再検証が望ましい
+- Finding 6（Rebuild中のcloneMediaAttempt無駄働き）の実運用での影響度は、テレメトリ不在のため「典型的ユーザーで数百〜数千件のmedia observation」という推定にとどまる（Codex自身の申告）
+- 全3パースペクティブとも読み取り専用サンドボックスのため`go test`を実際には実行しておらず、静的コード読解に基づく判断（Finding 1のみ人間レビュアーが実テストで独立検証済み）
 
-## エスカレーション候補
+## 実行上の注記（サブエージェント信頼性について）
 
-なし。全ての CRITICAL/WARNING 所見に対して具体的な修正コードが確定しており、実装判断のみが残っている。
+このレビュー実行中、3回にわたりサブエージェントが実際に`codex exec`を待たずに（「バックグラウンドタスクを起動して待つ」という趣旨の応答で）早期リターンする事象が発生した（Perspective C初回、hardening-gaps Round 2、Round 3の一部）。いずれも生raw outputファイルのサイズ検証（100バイト未満は失敗扱い）により検出し、メインエージェントが直接`codex exec`を同期的に再実行することで解決した。最終的にすべてのラウンドで実際のCodex出力を取得しており、捏造されたレビュー結果は本レポートに含まれていない。

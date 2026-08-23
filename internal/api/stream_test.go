@@ -74,6 +74,7 @@ func TestStream_BacklogSurvivesRestart(t *testing.T) {
 	defer b.Stop()
 
 	server := NewServer("127.0.0.1:0", testHealth(), WithBroadcaster(b, st))
+	server.SetReady(true)
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
 
@@ -190,6 +191,7 @@ func TestStream_LiveEventNotDuplicatedAfterBacklog(t *testing.T) {
 	defer b.Stop()
 
 	server := NewServer("127.0.0.1:0", testHealth(), WithBroadcaster(b, st))
+	server.SetReady(true)
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
 

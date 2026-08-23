@@ -147,12 +147,13 @@ curl http://127.0.0.1:8080/api/v1/health
 
 ## データベーススキーマのリセット
 
-SQLite スキーマは `PRAGMA user_version`（現在バージョン2）でバージョン管理されています。旧スキーマからの**自動マイグレーションはありません**。スキーマ不一致でアプリが起動を拒否した場合は、アプリを停止し、データベースファイル（アプリのデータディレクトリ内の `vrclog.sqlite`）をリネームまたは削除して新規に開始してください。履歴は失われますが、データ破損は発生しません。
+SQLite スキーマは `PRAGMA user_version`（現在バージョン3）でバージョン管理されています。旧スキーマからの**自動マイグレーションはありません**。バージョン3は上流 `vrclog-go` の Observation ID 識別子契約の変更（ID 公式から emission index を削除）を反映したもので、テーブル構造はバージョン2と同一ですがバージョン2の行はそのまま使えません。スキーマ不一致でアプリが起動を拒否した場合は、アプリを停止し、データベースファイル（アプリのデータディレクトリ内の `vrclog.sqlite`）をリネームまたは削除して新規に開始してください。履歴は失われますが、データ破損は発生しません。
 
 ## テスト
 
 ```bash
 go test ./...
+go test -race ./...
 go test -tags=integration ./test/integration/...
 go test -tags=e2e ./test/e2e/...
 ```
@@ -163,6 +164,8 @@ GitHub Actions で Windows / Linux runner 上のテストを自動実行。
 
 - `push` / `pull_request` でトリガー
 - Windows でビルド確認
+- Ubuntu 専用ジョブで全テストスイートを `-race` 付きで実行
+- Release workflow は `verify` job（lint, vet, unit, race, integration, E2E）が成功したときのみ Windows バイナリのビルド・公開に進む — tag push だけで未検証の artifact が公開されることはない
 
 ## セキュリティとプライバシー
 

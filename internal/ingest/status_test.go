@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -80,5 +81,57 @@ func TestStatusTracker_RecordErrorRedacts(t *testing.T) {
 	snap := tr.snapshot()
 	if strings.Contains(snap.LastError, "/Users/someone/secret") {
 		t.Fatalf("Status.LastError leaked a local path: %q", snap.LastError)
+	}
+}
+
+// TestStateFailed verifies the terminal-state contract for a fatal ingest
+// error: setFailed transitions to StateFailed and records a redacted error
+// message, but — unlike recordError — does not increment RetryCount, since
+// StateFailed is not a retry attempt.
+func TestStateFailed(t *testing.T) {
+	tr := newStatusTracker()
+	tr.recordError(errors.New("transient failure 1"))
+	tr.recordError(errors.New("transient failure 2"))
+
+	before := tr.snapshot()
+	if before.RetryCount != 2 {
+		t.Fatalf("RetryCount before setFailed = %d, want 2", before.RetryCount)
+	}
+
+	tr.setFailed(ErrIntegrityViolation)
+
+	snap := tr.snapshot()
+	if snap.State != StateFailed {
+		t.Fatalf("State = %s, want %s", snap.State, StateFailed)
+	}
+	if snap.RetryCount != before.RetryCount {
+		t.Fatalf("RetryCount = %d, want unchanged from %d (setFailed is not a retry)", snap.RetryCount, before.RetryCount)
+	}
+	if snap.LastError != "integrity violation" {
+		t.Fatalf("LastError = %q, want the fixed sentinel message", snap.LastError)
+	}
+}
+
+// TestPublicErrorMessage_IntegrityViolation verifies both fatal-error
+// sentinels map to safe, fixed strings for the unauthenticated health
+// endpoint, matching the pattern already used for vrclog.Follow sentinels.
+func TestPublicErrorMessage_IntegrityViolation(t *testing.T) {
+	if got := publicErrorMessage(ErrIntegrityViolation); got != "integrity violation" {
+		t.Errorf("publicErrorMessage(ErrIntegrityViolation) = %q", got)
+	}
+	if got := publicErrorMessage(ErrProjectionFailure); got != "projection failure" {
+		t.Errorf("publicErrorMessage(ErrProjectionFailure) = %q", got)
+	}
+
+	// The production error chain wraps rich diagnostic detail (adapter ID,
+	// rule ID) for internal logs via fmt.Errorf %w — publicErrorMessage
+	// must collapse this to the fixed sentinel string, not leak the detail
+	// to the unauthenticated health endpoint.
+	wrapped := fmt.Errorf(
+		"observation obs-123 conflicts with a differently-encoded stored row (adapter=vrchat.core rule=player_joined): %w",
+		ErrIntegrityViolation,
+	)
+	if got := publicErrorMessage(wrapped); got != "integrity violation" {
+		t.Errorf("publicErrorMessage(wrapped ErrIntegrityViolation) = %q, want %q", got, "integrity violation")
 	}
 }

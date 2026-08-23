@@ -58,7 +58,7 @@ Projector Manager.Apply → World / Presence / Media state
 | `internal/observation` | Observation persistence DTO + vrclog.Observation conversion |
 | `internal/projector` | World/Presence/Media derived state, rebuildable from DB |
 | `internal/sse` | Generic Observation broadcaster (single SSE event type) |
-| `internal/store` | SQLite persistence (schema v2, CommitRecord atomicity) |
+| `internal/store` | SQLite persistence (schema v3, CommitRecord atomicity) |
 | `webembed` | Embedded web UI filesystem (go:embed) |
 
 ### Dependency Injection
@@ -86,12 +86,14 @@ These hold regardless of future feature work — violating them is a regression,
 
 - **Canonical Event is owned by `vrclog-go`.** Companion never defines its own Event/EventKind type or a competing Adapter interface.
 - **Per-Record transaction.** `Store.CommitRecord` persists Observations + Diagnostics + cursor advancement atomically. The cursor is never committed separately from what produced it, even for zero-Observation Records.
-- **Observation ID is the only dedupe key.** Never raw-line hashing, URL canonicalization, or time-window dedupe. A same-ID-different-content conflict rolls back the transaction (`ErrObservationConflict`) rather than silently overwriting.
-- **Projectors rebuild from DB.** `projector.Manager.Rebuild` replays all Observations in sequence order at startup and must reach the same state a live `Apply` sequence would. Never persist projector state as a separate source of truth.
-- **No legacy migration.** SQLite schema is versioned via `PRAGMA user_version`; any unexpected version is fatal, never auto-migrated. Old databases are reset by the user renaming/deleting the file, not by app code.
+- **Observation ID is the only dedupe key.** Never raw-line hashing, URL canonicalization, or time-window dedupe. A same-ID-different-content conflict rolls back the transaction (`ErrObservationConflict`) rather than silently overwriting. At the `ingest.Runner` level this is fatal, not retried or dropped: `Run` returns an error wrapping `ErrIntegrityViolation`, `Status().State` becomes `StateFailed`, and the process performs a controlled shutdown with a non-zero exit — never drop-and-continue.
+- **Projectors rebuild from DB.** `projector.Manager.Rebuild` replays all Observations in sequence order at startup and must reach the same state a live `Apply` sequence would. Never persist projector state as a separate source of truth. A post-commit `Manager.Apply` failure inside `OnInsertFunc` is also fatal (`ErrProjectionFailure`, distinct from `ErrIntegrityViolation` since the DB itself is not corrupt) — restart replays from DB via Rebuild to recover.
+- **Projector state crossing the Manager boundary is always a deep copy.** `Change` values (`MediaAttemptUpdated.Attempt`, `WorldChanged.Current`/`Previous`, `WorldNameUpdated.Current`), `Snapshot()`, and `RecentMedia()` never return pointers into live internal state. `cloneMediaAttempt` is the single clone contract for MediaAttempt.
+- **Catch-up vs live delivery.** Every `SourceRecord` carries a `DeliveryPhase` (`catch_up` or `live`), determined by comparing against a `vrclog.LogSnapshot` captured at each `RecordSourceFactory.NewSource` call — never by timestamp comparison. Both phases are always applied to the Store and Projector; only `DeliveryLive` may trigger SSE broadcast or Discord notification.
+- **No legacy migration.** SQLite schema is versioned via `PRAGMA user_version`; any unexpected version is fatal, never auto-migrated. Old databases (including the pre-v3 Observation ID format) are reset by the user renaming/deleting the file, not by app code.
 - **Media URLs are sensitive.** Never sent to Discord, never auto-opened, never fed to external metadata lookups (no oEmbed/thumbnail/title fetch). Only `http`/`https` schemes may ever be presented as an "open in browser" action, and only on explicit user click.
 - **Generic SSE.** `/api/v1/stream` emits a single `event: observation` type; never add per-EventKind SSE event names. Last-Event-ID recovery uses `Store.LatestSequence()` (DB-backed, correct immediately after a process restart) as the backlog bound, not `Broadcaster.HighWaterSequence()` (in-memory, resets to 0 on restart) — see `internal/sse` and `internal/api/stream.go`.
-- **Adapter composition is compile-time.** `internal/adapter.BuildEngine()` wires `vrclog.NewVRChatAdapter()` + `adapters.All()` in fixed order. No runtime plugin loading, no YAML pattern config, no remote adapter catalog.
+- **Adapter composition is compile-time and explicit.** `internal/adapter.BuildEngine()` wires `vrclog.NewVRChatAdapter()` with individually imported community adapters (`yamaplayer.New()`, `iwasync3.New()`) in fixed order — never a `vrclog-adapters` aggregate/`All()` import, so a new community adapter can never be pulled in without an explicit diff and review. No runtime plugin loading, no YAML pattern config, no remote adapter catalog.
 
 ## Key Design Decisions
 

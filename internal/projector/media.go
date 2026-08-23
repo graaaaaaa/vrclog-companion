@@ -18,10 +18,22 @@ const (
 
 // mediaCorrelationWindow bounds how far apart (by OccurredAt) two
 // Observations may be to still be considered part of the same media
-// attempt when no exact target/URL match exists. The comparison is
-// inclusive (<=) so the boundary itself is a valid match, and startup
-// rebuild reproduces the exact same grouping as the live path.
+// attempt. It applies uniformly to exact-target, exact-URL, and
+// single-recent-candidate matching alike — an exact match arbitrarily far
+// in the past must not merge into a new, unrelated playback attempt. The
+// comparison is inclusive (<=) so the boundary itself is a valid match,
+// and startup rebuild reproduces the exact same grouping as the live path.
 const mediaCorrelationWindow = 10 * time.Second
+
+// mediaSourceDuplicateWindow bounds the narrower merge rule for
+// role=source events: only an exact-URL duplicate observed again within
+// this window is considered the same playback attempt (a duplicate
+// emission burst, e.g. from two adapters observing the same source line).
+// Any other role=source event — even one matching the same target or a
+// slightly later duplicate URL outside this window — starts a new
+// Attempt, since role=source is where a genuinely new playback most often
+// begins.
+const mediaSourceDuplicateWindow = 2 * time.Second
 
 // mediaMaxRecent bounds in-memory attempt history. DB Observations are
 // never deleted; only this projected view is capped.
@@ -124,7 +136,7 @@ func (m *mediaProjector) resetSession(newWorldInstanceID string) {
 	m.currentWorldInstanceID = newWorldInstanceID
 }
 
-func (m *mediaProjector) applyResourceURL(ev vrclog.ResourceURLObserved, obs observation.StoredObservation) []Change {
+func (m *mediaProjector) applyResourceURL(ev vrclog.ResourceURLObserved, obs observation.StoredObservation, emit bool) []Change {
 	target := targetFromEvent(ev.Target)
 	res := MediaResourceObservation{
 		URL: ev.Resource.URL, Kind: string(ev.Resource.Kind), Role: string(ev.Resource.Role),
@@ -133,12 +145,11 @@ func (m *mediaProjector) applyResourceURL(ev vrclog.ResourceURLObserved, obs obs
 
 	var attempt *MediaAttempt
 	if ev.Resource.Role == vrclog.ResourceRoleSource {
-		// role=source defaults to starting a new Attempt unless it
-		// unambiguously matches an existing one by target or URL.
-		attempt = m.findByExactTarget(target)
-		if attempt == nil {
-			attempt = m.findByExactURL(ev.Resource.URL)
-		}
+		// role=source merges only into a genuine duplicate-emission burst
+		// (spec §7.3); target/URL matches outside that narrow rule always
+		// start a new Attempt, since role=source is where a new playback
+		// attempt most often begins.
+		attempt = m.findSourceDuplicate(ev.Resource.URL, target, obs.OccurredAt)
 	} else {
 		attempt = m.findCandidate(target, []string{ev.Resource.URL}, obs.OccurredAt)
 	}
@@ -151,21 +162,26 @@ func (m *mediaProjector) applyResourceURL(ev vrclog.ResourceURLObserved, obs obs
 	m.touch(attempt, obs.OccurredAt)
 	m.promote(attempt, isNew)
 
-	return []Change{MediaAttemptUpdated{Attempt: attempt, At: obs.OccurredAt}}
+	if !emit {
+		return nil
+	}
+	return []Change{MediaAttemptUpdated{Attempt: cloneMediaAttempt(attempt), At: obs.OccurredAt}}
 }
 
-func (m *mediaProjector) applyResourceResolved(ev vrclog.ResourceResolved, obs observation.StoredObservation) []Change {
+func (m *mediaProjector) applyResourceResolved(ev vrclog.ResourceResolved, obs observation.StoredObservation, emit bool) []Change {
 	target := targetFromEvent(ev.Target)
 
-	attempt := m.findByExactTarget(target)
+	// Correlation cascade per spec §7.5: Input URL -> exact target ->
+	// Output URL -> single recent candidate -> new Attempt.
+	attempt := m.findByExactURL(ev.Input.URL, target, obs.OccurredAt, mediaCorrelationWindow)
 	if attempt == nil {
-		attempt = m.findByExactURL(ev.Input.URL)
+		attempt = m.findByExactTarget(target, obs.OccurredAt, mediaCorrelationWindow)
 	}
 	if attempt == nil {
-		attempt = m.findByExactURL(ev.Output.URL)
+		attempt = m.findByExactURL(ev.Output.URL, target, obs.OccurredAt, mediaCorrelationWindow)
 	}
 	if attempt == nil {
-		attempt = m.findSingleRecentCandidate(target, obs.OccurredAt)
+		attempt = m.findSingleRecentCandidate(target, obs.OccurredAt, mediaCorrelationWindow)
 	}
 
 	isNew := attempt == nil
@@ -173,21 +189,34 @@ func (m *mediaProjector) applyResourceResolved(ev vrclog.ResourceResolved, obs o
 		attempt = m.newAttempt(obs, target)
 	}
 
-	// Only the resolved Output is recorded, tagged role=resolved so
-	// attachResource's Best-URL priority table excludes it — it stays in
-	// details and never overrides a source/resolver/playback URL.
+	// Both Input and Output are recorded as Resources, each keeping its
+	// own canonical Kind/Role/URL (spec §7.5) — this is what lets a
+	// standalone ResourceResolved (no prior ResourceURLObserved) still
+	// surface Input as a BestOpenableURL candidate, since Input typically
+	// carries an openable role (e.g. resolver_input) while Output's role
+	// (typically resolved) is excluded from the priority table.
+	inputRes := MediaResourceObservation{
+		URL: ev.Input.URL, Kind: string(ev.Input.Kind), Role: string(ev.Input.Role),
+		AdapterID: string(obs.AdapterID), RuleID: string(obs.RuleID), ObservationID: string(obs.ID), ObservedAt: obs.OccurredAt,
+	}
+	m.attachResource(attempt, inputRes, target)
+
 	outputRes := MediaResourceObservation{
-		URL: ev.Output.URL, Kind: string(ev.Output.Kind), Role: string(vrclog.ResourceRoleResolved),
+		URL: ev.Output.URL, Kind: string(ev.Output.Kind), Role: string(ev.Output.Role),
 		AdapterID: string(obs.AdapterID), RuleID: string(obs.RuleID), ObservationID: string(obs.ID), ObservedAt: obs.OccurredAt,
 	}
 	m.attachResource(attempt, outputRes, target)
+
 	m.touch(attempt, obs.OccurredAt)
 	m.promote(attempt, isNew)
 
-	return []Change{MediaAttemptUpdated{Attempt: attempt, At: obs.OccurredAt}}
+	if !emit {
+		return nil
+	}
+	return []Change{MediaAttemptUpdated{Attempt: cloneMediaAttempt(attempt), At: obs.OccurredAt}}
 }
 
-func (m *mediaProjector) applyMediaError(ev vrclog.MediaErrorObserved, obs observation.StoredObservation) []Change {
+func (m *mediaProjector) applyMediaError(ev vrclog.MediaErrorObserved, obs observation.StoredObservation, emit bool) []Change {
 	target := targetFromEvent(ev.Target)
 
 	var errorURL string
@@ -195,17 +224,36 @@ func (m *mediaProjector) applyMediaError(ev vrclog.MediaErrorObserved, obs obser
 		errorURL = ev.Resource.URL
 	}
 
-	attempt := m.findByExactTarget(target)
-	if attempt == nil && errorURL != "" {
-		attempt = m.findByExactURL(errorURL)
+	// Correlation cascade per spec §7.6: exact URL (if a Resource is
+	// present) -> exact target -> single recent candidate -> new Attempt.
+	var attempt *MediaAttempt
+	if errorURL != "" {
+		attempt = m.findByExactURL(errorURL, target, obs.OccurredAt, mediaCorrelationWindow)
 	}
 	if attempt == nil {
-		attempt = m.findSingleRecentCandidate(target, obs.OccurredAt)
+		attempt = m.findByExactTarget(target, obs.OccurredAt, mediaCorrelationWindow)
+	}
+	if attempt == nil {
+		attempt = m.findSingleRecentCandidate(target, obs.OccurredAt, mediaCorrelationWindow)
 	}
 
 	isNew := attempt == nil
 	if isNew {
 		attempt = m.newAttempt(obs, target)
+	}
+
+	// Attach the error's own Resource (if present) so its URL can still
+	// become a BestOpenableURL candidate — an error-only Observation that
+	// carries an openable URL (e.g. role=source) must not lose it just
+	// because it was only used for correlation lookup above. No current
+	// adapter (core/yamaplayer/iwasync3) populates MediaErrorObserved.Resource,
+	// but the canonical field exists and future adapters may use it.
+	if ev.Resource != nil {
+		res := MediaResourceObservation{
+			URL: ev.Resource.URL, Kind: string(ev.Resource.Kind), Role: string(ev.Resource.Role),
+			AdapterID: string(obs.AdapterID), RuleID: string(obs.RuleID), ObservationID: string(obs.ID), ObservedAt: obs.OccurredAt,
+		}
+		m.attachResource(attempt, res, target)
 	}
 
 	mediaErr := MediaError{
@@ -216,22 +264,63 @@ func (m *mediaProjector) applyMediaError(ev vrclog.MediaErrorObserved, obs obser
 	m.touch(attempt, obs.OccurredAt)
 	m.promote(attempt, isNew)
 
-	return []Change{MediaAttemptUpdated{Attempt: attempt, At: obs.OccurredAt}}
+	if !emit {
+		return nil
+	}
+	return []Change{MediaAttemptUpdated{Attempt: cloneMediaAttempt(attempt), At: obs.OccurredAt}}
 }
 
 // findCandidate implements the shared exact-target -> exact-URL ->
 // single-unambiguous-recent-candidate cascade used by resolver/playback
-// resource events.
+// resource events (spec §7.4), all bounded by mediaCorrelationWindow.
 func (m *mediaProjector) findCandidate(target *MediaTargetDTO, urls []string, occurredAt time.Time) *MediaAttempt {
-	if a := m.findByExactTarget(target); a != nil {
+	if a := m.findByExactTarget(target, occurredAt, mediaCorrelationWindow); a != nil {
 		return a
 	}
 	for _, u := range urls {
-		if a := m.findByExactURL(u); a != nil {
+		if a := m.findByExactURL(u, target, occurredAt, mediaCorrelationWindow); a != nil {
 			return a
 		}
 	}
-	return m.findSingleRecentCandidate(target, occurredAt)
+	return m.findSingleRecentCandidate(target, occurredAt, mediaCorrelationWindow)
+}
+
+// findSourceDuplicate implements the narrow role=source merge rule (spec
+// §7.3): the exact same URL observed again within mediaSourceDuplicateWindow,
+// with a non-conflicting target, in the current world session. Any other
+// case — a different URL, a same-target-different-URL event, or a
+// same-URL event outside the window — returns nil so the caller starts a
+// new Attempt instead.
+func (m *mediaProjector) findSourceDuplicate(rawURL string, target *MediaTargetDTO, occurredAt time.Time) *MediaAttempt {
+	if rawURL == "" {
+		return nil
+	}
+	for _, a := range m.currentSessionAttempts() {
+		if !withinWindow(a.LastObservedAt, occurredAt, mediaSourceDuplicateWindow) {
+			continue
+		}
+		if targetConflicts(a.Target, target) {
+			continue
+		}
+		for _, r := range a.Resources {
+			if r.URL == rawURL {
+				return a
+			}
+		}
+	}
+	return nil
+}
+
+// targetConflicts reports whether a and b both specify a non-empty
+// Component+Key identity and those identities differ — i.e. they
+// unambiguously name two different on-screen targets. A nil or
+// empty-Key target on either side is not a conflict (absence of
+// information, not evidence of a different target).
+func targetConflicts(a, b *MediaTargetDTO) bool {
+	if a == nil || a.Key == "" || b == nil || b.Key == "" {
+		return false
+	}
+	return a.Component != b.Component || a.Key != b.Key
 }
 
 // currentSessionAttempts returns recent Attempts scoped to the current
@@ -251,23 +340,39 @@ func (m *mediaProjector) currentSessionAttempts() []*MediaAttempt {
 	return out
 }
 
-func (m *mediaProjector) findByExactTarget(target *MediaTargetDTO) *MediaAttempt {
+// findByExactTarget matches an Attempt sharing target's exact
+// Component+Key, bounded by window (spec §7.2: no unbounded-time helper —
+// every exact match still needs to be recent relative to occurredAt).
+func (m *mediaProjector) findByExactTarget(target *MediaTargetDTO, occurredAt time.Time, window time.Duration) *MediaAttempt {
 	if target == nil || target.Key == "" {
 		return nil
 	}
 	for _, a := range m.currentSessionAttempts() {
-		if a.Target != nil && a.Target.Component == target.Component && a.Target.Key == target.Key {
+		if a.Target != nil && a.Target.Component == target.Component && a.Target.Key == target.Key &&
+			withinWindow(a.LastObservedAt, occurredAt, window) {
 			return a
 		}
 	}
 	return nil
 }
 
-func (m *mediaProjector) findByExactURL(rawURL string) *MediaAttempt {
+// findByExactURL matches an Attempt with a Resource sharing rawURL
+// exactly, bounded by window and target compatibility — two different
+// on-screen targets that happen to share a URL (e.g. the same video URL
+// played on two different AVPro players) must never merge just because
+// the URL matches, mirroring the same targetConflicts guard used by
+// findSourceDuplicate and findSingleRecentCandidate.
+func (m *mediaProjector) findByExactURL(rawURL string, target *MediaTargetDTO, occurredAt time.Time, window time.Duration) *MediaAttempt {
 	if rawURL == "" {
 		return nil
 	}
 	for _, a := range m.currentSessionAttempts() {
+		if !withinWindow(a.LastObservedAt, occurredAt, window) {
+			continue
+		}
+		if targetConflicts(a.Target, target) {
+			continue
+		}
 		for _, r := range a.Resources {
 			if r.URL == rawURL {
 				return a
@@ -278,16 +383,14 @@ func (m *mediaProjector) findByExactURL(rawURL string) *MediaAttempt {
 }
 
 // findSingleRecentCandidate implements priority 4: exactly one candidate
-// within the correlation window, in the current world session, with no
-// conflicting target.
-func (m *mediaProjector) findSingleRecentCandidate(target *MediaTargetDTO, occurredAt time.Time) *MediaAttempt {
+// within window, in the current world session, with no conflicting target.
+func (m *mediaProjector) findSingleRecentCandidate(target *MediaTargetDTO, occurredAt time.Time, window time.Duration) *MediaAttempt {
 	var candidates []*MediaAttempt
 	for _, a := range m.currentSessionAttempts() {
-		if !withinWindow(a.LastObservedAt, occurredAt, mediaCorrelationWindow) {
+		if !withinWindow(a.LastObservedAt, occurredAt, window) {
 			continue
 		}
-		if a.Target != nil && a.Target.Key != "" && target != nil && target.Key != "" &&
-			!(a.Target.Component == target.Component && a.Target.Key == target.Key) {
+		if targetConflicts(a.Target, target) {
 			continue
 		}
 		candidates = append(candidates, a)
@@ -383,17 +486,30 @@ func (m *mediaProjector) latestOpenable() *LatestOpenableMedia {
 	return nil
 }
 
-// recentSnapshot returns defensive copies of the recent Attempts,
+// cloneMediaAttempt returns a deep copy of a — including Target and every
+// slice field — so the result shares no mutable memory with the internal
+// MediaAttempt a points to. This is the single clone contract used
+// everywhere a MediaAttempt crosses the Manager boundary: Change emission,
+// recentSnapshot, and any future API DTO conversion.
+func cloneMediaAttempt(a *MediaAttempt) MediaAttempt {
+	cp := *a
+	if a.Target != nil {
+		t := *a.Target
+		cp.Target = &t
+	}
+	cp.Resources = append([]MediaResourceObservation(nil), a.Resources...)
+	cp.Errors = append([]MediaError(nil), a.Errors...)
+	cp.ObservationIDs = append([]string(nil), a.ObservationIDs...)
+	cp.AdapterIDs = append([]string(nil), a.AdapterIDs...)
+	return cp
+}
+
+// recentSnapshot returns defensive deep copies of the recent Attempts,
 // newest-first, for safe hand-off to API handlers.
-func (m *mediaProjector) recentSnapshot() []*MediaAttempt {
-	out := make([]*MediaAttempt, len(m.recent))
+func (m *mediaProjector) recentSnapshot() []MediaAttempt {
+	out := make([]MediaAttempt, len(m.recent))
 	for i, a := range m.recent {
-		cp := *a
-		cp.Resources = append([]MediaResourceObservation(nil), a.Resources...)
-		cp.Errors = append([]MediaError(nil), a.Errors...)
-		cp.ObservationIDs = append([]string(nil), a.ObservationIDs...)
-		cp.AdapterIDs = append([]string(nil), a.AdapterIDs...)
-		out[i] = &cp
+		out[i] = cloneMediaAttempt(a)
 	}
 	return out
 }
